@@ -12,6 +12,8 @@ add_executable(bittorrent_simulator
         inc/simulator/Peer.hpp
         inc/simulator/Link.hpp
         src/Link.cpp
+        inc/simulator/Message.hpp
+        src/Message.cpp
 )
 
 target_include_directories(bittorrent_simulator PRIVATE
