@@ -1,23 +1,24 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 
 namespace simulator {
 
-    struct Event {
-        double time;
-        std::uint64_t sequence;
-        std::function<void()> action;
+    class Event {
+    public:
+        explicit Event(double time) : time_(time) {}
+        virtual ~Event() = default;
 
-        bool operator<(const Event& other) const
-        {
-            if (time != other.time) {
-                return time > other.time;
-            }
+        virtual void execute() = 0;
 
-            return sequence > other.sequence;
-        }
+        double time() const { return time_; }
+        std::uint64_t sequence() const { return sequence_; }
+
+    private:
+        friend class Simulation;
+
+        double time_;
+        std::uint64_t sequence_{};
     };
 
 } // namespace simulator

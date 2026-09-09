@@ -4,6 +4,8 @@
 
 namespace simulator {
 
+    using PeerId = std::uint32_t;
+
     class Peer {
     public:
         explicit Peer(std::uint32_t id);

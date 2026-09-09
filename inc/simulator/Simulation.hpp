@@ -1,8 +1,8 @@
 #pragma once
 
 #include <cstdint>
-#include <queue>
-#include <functional>
+#include <memory>
+#include <vector>
 
 #include "simulator/Event.hpp"
 
@@ -12,7 +12,7 @@ namespace simulator {
     public:
         Simulation();
 
-        void schedule(double time, std::function<void()> action);
+        void schedule(std::unique_ptr<Event> event);
 
         void run();
 
@@ -22,7 +22,7 @@ namespace simulator {
         double current_time_;
         std::uint64_t next_sequence_;
 
-        std::priority_queue<Event> event_queue_;
+        std::vector<std::unique_ptr<Event>> event_queue_;
     };
 
 } // namespace simulator

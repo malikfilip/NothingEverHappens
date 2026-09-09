@@ -1,6 +1,19 @@
 #include "simulator/Simulation.hpp"
 
+#include <algorithm>
+#include <utility>
+
 namespace simulator {
+
+    namespace {
+        bool laterEvent(const std::unique_ptr<Event>& left, const std::unique_ptr<Event>& right)
+        {
+            if (left->time() != right->time()) {
+                return left->time() > right->time();
+            }
+            return left->sequence() > right->sequence();
+        }
+    }
 
     Simulation::Simulation()
         : current_time_(0.0),
@@ -8,29 +21,24 @@ namespace simulator {
     {
     }
 
-    void Simulation::schedule(double time, std::function<void()> action)
+    void Simulation::schedule(std::unique_ptr<Event> event)
     {
-        if (time < currentTime() )return;
-        Event event{
-            time,
-            next_sequence_,
-            action
-        };
+        if (!event || event->time() < currentTime()) return;
 
-        ++next_sequence_;
-
-        event_queue_.push(event);
+        event->sequence_ = next_sequence_++;
+        event_queue_.push_back(std::move(event));
+        std::push_heap(event_queue_.begin(), event_queue_.end(), laterEvent);
     }
 
     void Simulation::run()
     {
         while (!event_queue_.empty()) {
-            Event event = event_queue_.top();
-            event_queue_.pop();
+            std::pop_heap(event_queue_.begin(), event_queue_.end(), laterEvent);
+            auto event = std::move(event_queue_.back());
+            event_queue_.pop_back();
 
-            current_time_ = event.time;
-
-            event.action();
+            current_time_ = event->time();
+            event->execute();
         }
     }
 
