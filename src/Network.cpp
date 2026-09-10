@@ -16,7 +16,7 @@ namespace simulator {
     {
     }
 
-    void Network::send(PeerId sender, PeerId receiver, Message message)
+    void Network::send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
     {
         const auto from = std::find_if(peers_.begin(), peers_.end(),
             [sender](const Peer& peer) { return peer.id() == sender; });
@@ -53,7 +53,7 @@ namespace simulator {
             throw std::invalid_argument("Arrival time must be finite");
         }
         simulation_.schedule(std::make_unique<MessageArrivalEvent>(
-            arrivalTime, sender, receiver, std::move(message)));
+            arrivalTime, swarmId, sender, receiver, std::move(message)));
     }
 
 } // namespace simulator

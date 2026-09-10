@@ -5,6 +5,7 @@
 #include "simulator/Link.hpp"
 #include "simulator/Message.hpp"
 #include "simulator/Peer.hpp"
+#include "simulator/SwarmId.hpp"
 
 namespace simulator {
 
@@ -17,7 +18,7 @@ namespace simulator {
 
         // Schedules arrival; throws std::invalid_argument for missing endpoints,
         // a missing link, or invalid transfer bandwidth/latency.
-        void send(PeerId sender, PeerId receiver, Message message);
+        void send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message);
 
     private:
         Simulation& simulation_;

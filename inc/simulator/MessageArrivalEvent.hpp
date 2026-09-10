@@ -5,19 +5,21 @@
 #include "simulator/Event.hpp"
 #include "simulator/Message.hpp"
 #include "simulator/Peer.hpp"
+#include "simulator/SwarmId.hpp"
 
 namespace simulator {
 
     class MessageArrivalEvent : public Event {
     public:
-        MessageArrivalEvent(double time, PeerId sender, PeerId receiver, Message message)
-            : Event(time), sender_(sender), receiver_(receiver), message_(std::move(message))
+        MessageArrivalEvent(double time, SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
+            : Event(time), swarmId_(swarmId), sender_(sender), receiver_(receiver), message_(std::move(message))
         {
         }
 
         void execute() override {}
 
     private:
+        SwarmId swarmId_;
         PeerId sender_;
         PeerId receiver_;
         Message message_;
