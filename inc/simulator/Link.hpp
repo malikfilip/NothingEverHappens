@@ -16,6 +16,7 @@ namespace simulator {
         std::uint32_t endpointA() const;
         std::uint32_t endpointB() const;
 
+        // Bandwidth is bits per second; latency is simulation seconds.
         double bandwidth() const;
         double latency() const;
 
