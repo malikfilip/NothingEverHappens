@@ -14,6 +14,9 @@ add_executable(bittorrent_simulator
         src/Link.cpp
         inc/simulator/Message.hpp
         src/Message.cpp
+        inc/simulator/InfoHash.hpp
+        inc/simulator/Swarm.hpp
+        src/Swarm.cpp
         inc/simulator/Network.hpp
         src/Network.cpp
 )

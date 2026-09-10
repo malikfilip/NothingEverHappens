@@ -5,6 +5,8 @@
 #include <variant>
 #include <vector>
 
+#include "simulator/InfoHash.hpp"
+
 namespace simulator {
 
     enum class MessageType {
@@ -23,7 +25,7 @@ namespace simulator {
     struct EmptyPayload {};
 
     struct HandshakePayload {
-        std::array<std::uint8_t, 20> infoHash{};
+        InfoHash infoHash{};
         std::array<std::uint8_t, 20> peerId{};
     };
 
