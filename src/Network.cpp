@@ -11,9 +11,39 @@
 
 namespace simulator {
 
-    Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links)
-        : simulation_(simulation), peers_(std::move(peers)), links_(std::move(links))
+    Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms)
+        : simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
     {
+    }
+
+    const Peer& Network::peer(PeerId id) const
+    {
+        const auto found = std::find_if(peers_.begin(), peers_.end(),
+            [id](const Peer& peer) { return peer.id() == id; });
+        if (found == peers_.end()) {
+            throw std::invalid_argument("Unknown peer");
+        }
+        return *found;
+    }
+
+    const Swarm& Network::swarm(SwarmId id) const
+    {
+        const auto found = std::find_if(swarms_.begin(), swarms_.end(),
+            [id](const Swarm& swarm) { return swarm.id() == id; });
+        if (found == swarms_.end()) {
+            throw std::invalid_argument("Unknown swarm");
+        }
+        return *found;
+    }
+
+    void Network::deliver(SwarmId swarmId, PeerId sender, PeerId receiver, const Message& message)
+    {
+        const auto to = std::find_if(peers_.begin(), peers_.end(),
+            [receiver](const Peer& peer) { return peer.id() == receiver; });
+        if (to == peers_.end()) {
+            throw std::invalid_argument("Unknown receiver");
+        }
+        to->receiveMessage(swarm(swarmId), sender, message);
     }
 
     void Network::send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
@@ -53,7 +83,7 @@ namespace simulator {
             throw std::invalid_argument("Arrival time must be finite");
         }
         simulation_.schedule(std::make_unique<MessageArrivalEvent>(
-            arrivalTime, swarmId, sender, receiver, std::move(message)));
+            arrivalTime, *this, swarmId, sender, receiver, std::move(message)));
     }
 
 } // namespace simulator

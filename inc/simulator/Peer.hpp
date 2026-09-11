@@ -11,6 +11,7 @@ namespace simulator {
     using PeerId = std::uint32_t;
 
     class Swarm;
+    class Message;
 
     struct PeerConnectionState {
         bool remoteChokingUs = true;
@@ -36,6 +37,8 @@ namespace simulator {
 
         // Throws std::invalid_argument if this SwarmId is already joined.
         void joinSwarm(const Swarm& swarm);
+        // Throws std::invalid_argument for unjoined swarms or invalid HAVE/BITFIELD.
+        void receiveMessage(const Swarm& swarm, PeerId sender, const Message& message);
         bool hasSwarm(SwarmId swarmId) const;
         // Throws std::out_of_range if this SwarmId has not been joined.
         const PeerSwarmState& swarmState(SwarmId swarmId) const;
