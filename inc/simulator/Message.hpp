@@ -1,6 +1,6 @@
 #pragma once
 
-#include <array>
+#include "simulator/PeerProtocolId.hpp"
 #include <cstdint>
 #include <variant>
 #include <vector>
@@ -26,7 +26,7 @@ namespace simulator {
 
     struct HandshakePayload {
         InfoHash infoHash{};
-        std::array<std::uint8_t, 20> peerId{};
+        PeerProtocolId peerId{};
     };
 
     struct HavePayload {

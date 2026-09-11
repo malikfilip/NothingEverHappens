@@ -43,7 +43,11 @@ namespace simulator {
         if (to == peers_.end()) {
             throw std::invalid_argument("Unknown receiver");
         }
-        to->receiveMessage(swarm(swarmId), sender, message);
+        const PeerProtocolId* senderProtocolId = nullptr;
+        if (message.type() == MessageType::Handshake) {
+            senderProtocolId = &peer(sender).protocolId();
+        }
+        to->receiveMessage(swarm(swarmId), sender, message, senderProtocolId);
     }
 
     void Network::send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)

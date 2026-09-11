@@ -22,6 +22,18 @@ void rejects(Action action)
     throw std::runtime_error("Expected std::invalid_argument");
 }
 
+const PeerProtocolId testSenderProtocolId{0xa1, 0x37, 0x59};
+
+Message handshake(const Swarm& swarm, const PeerProtocolId& id = testSenderProtocolId)
+{
+    return Message(MessageType::Handshake, HandshakePayload{swarm.infoHash(), id});
+}
+
+void establishHandshake(Peer& receiver, const Swarm& swarm)
+{
+    receiver.receiveMessage(swarm, 1, handshake(swarm), &testSenderProtocolId);
+}
+
 int existingDeliveryRegression()
 {
     try {
@@ -31,7 +43,9 @@ int existingDeliveryRegression()
         rejects([&] { receiver.receiveMessage(swarm, 1, Message(MessageType::Unchoke)); });
         receiver.joinSwarm(swarm);
         receiver.joinSwarm(other);
-        auto receive = [&](Message message) { receiver.receiveMessage(swarm, 1, message); };
+        auto receive = [&](Message message) {
+            receiver.receiveMessage(swarm, 1, message, &testSenderProtocolId);
+        };
         auto remote = [&]() -> const PeerConnectionState& {
             return receiver.swarmState(1).connections.at(1);
         };
@@ -39,6 +53,7 @@ int existingDeliveryRegression()
         rejects([&] { receive(Message(MessageType::Have, HavePayload{9})); });
         rejects([&] { receive(Message(MessageType::Bitfield, BitfieldPayload{{}})); });
         check(receiver.swarmState(1).connections.empty());
+        establishHandshake(receiver, swarm);
         receive(Message(MessageType::Choke));
         check(remote().remoteChokingUs && !remote().remoteInterestedInUs);
         check(remote().remoteBitfield == std::vector<std::uint8_t>({0, 0}));
@@ -68,10 +83,11 @@ int existingDeliveryRegression()
         receive(Message(MessageType::Bitfield, BitfieldPayload{{0x40, 0}}));
         check(remote().remoteBitfield == std::vector<std::uint8_t>({0x40, 0}));
         check(receiver.swarmState(2).connections.empty());
+        establishHandshake(receiver, other);
         receiver.receiveMessage(other, 1, Message(MessageType::Bitfield, BitfieldPayload{{0xff}}));
         check(receiver.swarmState(2).connections.at(1).remoteBitfield[0] == 0xff);
         for (const auto& message : {
-                Message(MessageType::Handshake, HandshakePayload{}),
+                handshake(swarm),
                 Message(MessageType::Request, RequestPayload{}),
                 Message(MessageType::Piece, PiecePayload{}),
                 Message(MessageType::Cancel, CancelPayload{})}) {
@@ -80,7 +96,7 @@ int existingDeliveryRegression()
         check(remote().remoteChokingUs && !remote().remoteInterestedInUs);
         check(remote().remoteBitfield == std::vector<std::uint8_t>({0x40, 0}));
 
-        Peer sender(1, 1000, 1000);
+        Peer sender(1, 1000, 1000, testSenderProtocolId);
         sender.joinSwarm(swarm);
         Simulation simulation;
         Network network(simulation, {sender, receiver}, {Link(1, 2, 800, 0.1)}, {swarm, other});
@@ -106,7 +122,10 @@ struct Fixture {
     Swarm swarm{1, {}, 9};
     Peer receiver{2, 500, 500};
 
-    Fixture() { receiver.joinSwarm(swarm); }
+    explicit Fixture(bool ready = true) {
+        receiver.joinSwarm(swarm);
+        if (ready) establishHandshake(receiver, swarm);
+    }
     void receive(Message message, PeerId sender = 1) {
         receiver.receiveMessage(swarm, sender, message);
     }
@@ -126,6 +145,7 @@ void checkUnchanged(const PeerSwarmState& actual, const PeerSwarmState& before)
     check(actual.connections.size() == before.connections.size());
     for (const auto& [id, expected] : before.connections) {
         const auto& connection = actual.connections.at(id);
+        check(connection.handshakeComplete == expected.handshakeComplete);
         check(connection.remoteChokingUs == expected.remoteChokingUs);
         check(connection.remoteInterestedInUs == expected.remoteInterestedInUs);
         check(connection.remoteBitfield == expected.remoteBitfield);
@@ -212,6 +232,7 @@ void bitfield()
     }
     const Swarm aligned(2, {}, 8);
     f.receiver.joinSwarm(aligned);
+    establishHandshake(f.receiver, aligned);
     f.receiver.receiveMessage(aligned, 1, Message(MessageType::Bitfield, BitfieldPayload{{0xff}}));
     check(f.receiver.swarmState(2).connections.at(1).remoteBitfield
           == std::vector<std::uint8_t>({0xff}));
@@ -274,7 +295,7 @@ void arrivalTiming()
 {
     Fixture f;
     f.receive(Message(MessageType::Choke));
-    Peer sender(1, 1000, 1000);
+    Peer sender(1, 1000, 1000, testSenderProtocolId);
     sender.joinSwarm(f.swarm);
     Simulation simulation;
     Network network(simulation, {sender, f.receiver}, {Link(1, 2, 800, 0.1)}, {f.swarm});
@@ -291,12 +312,192 @@ void arrivalTiming()
     check(observations == 3);
     check(!network.peer(2).swarmState(1).connections.at(1).remoteChokingUs);
 }
+struct HandshakeFixture {
+    Swarm swarm{1, InfoHash{0x13, 0x57}, 9};
+    Swarm other{2, InfoHash{0x24}, 9};
+    Peer sender{1, 1000, 1000, testSenderProtocolId};
+    Peer receiver{2, 500, 500, PeerProtocolId{0xb2}};
+    Peer third{3, 1000, 1000, PeerProtocolId{0xc3}};
+    Simulation simulation;
+    Network network;
+
+    HandshakeFixture()
+        : network(simulation, joinedPeers(), {Link(1, 2, 800, 0.1)}, {swarm, other}) {}
+    std::vector<Peer> joinedPeers() {
+        for (Peer* peer : {&sender, &receiver, &third}) {
+            peer->joinSwarm(swarm);
+            peer->joinSwarm(other);
+        }
+        return {sender, receiver, third};
+    }
+    void deliver(const Message& message) { network.deliver(1, 1, 2, message); }
+    const PeerSwarmState& state() const { return network.peer(2).swarmState(1); }
+    void complete() { deliver(handshake(swarm, sender.protocolId())); }
+};
+
+void validHandshake()
+{
+    HandshakeFixture f;
+    check(!PeerConnectionState{}.handshakeComplete);
+    check(f.sender.id() == 1 && f.sender.protocolId() == testSenderProtocolId);
+    check(f.state().connections.empty());
+    f.complete();
+    const auto& remote = f.state().connections.at(1);
+    check(remote.handshakeComplete);
+    check(remote.remoteChokingUs && !remote.remoteInterestedInUs);
+    check(remote.remoteBitfield == std::vector<std::uint8_t>({0, 0}));
+    f.deliver(Message(MessageType::Unchoke));
+    check(!f.state().connections.at(1).remoteChokingUs);
+    const auto before = f.state();
+    f.complete();
+    checkUnchanged(f.state(), before);
+}
+
+void invalidHandshake(bool wrongHash)
+{
+    HandshakeFixture f;
+    f.network.deliver(1, 3, 2, handshake(f.swarm, f.third.protocolId()));
+    f.network.deliver(1, 3, 2, Message(MessageType::Interested));
+    f.network.deliver(2, 1, 2, handshake(f.other, f.sender.protocolId()));
+    const auto otherBefore = f.network.peer(2).swarmState(2);
+    // Every byte, including the last byte, must participate in equality.
+    for (std::size_t byte = 0; byte < 20; ++byte) {
+        auto payload = HandshakePayload{f.swarm.infoHash(), f.sender.protocolId()};
+        if (wrongHash) payload.infoHash[byte] ^= 1;
+        else payload.peerId[byte] ^= 1;
+        const auto before = f.state();
+        rejects([&] { f.deliver(Message(MessageType::Handshake, payload)); });
+        checkUnchanged(f.state(), before);
+        check(!f.state().connections.contains(1));
+        checkUnchanged(f.network.peer(2).swarmState(2), otherBefore);
+    }
+    // The existing REQUEST no-op creates a default connection, allowing us
+    // to check an existing incomplete connection without adding protocol behavior.
+    f.deliver(Message(MessageType::Request, RequestPayload{}));
+    check(!f.state().connections.at(1).handshakeComplete);
+    auto payload = HandshakePayload{f.swarm.infoHash(), f.sender.protocolId()};
+    if (wrongHash) payload.infoHash.back() ^= 1;
+    else payload.peerId.back() ^= 1;
+    const auto before = f.state();
+    rejects([&] { f.deliver(Message(MessageType::Handshake, payload)); });
+    checkUnchanged(f.state(), before);
+    check(!f.state().connections.at(1).handshakeComplete);
+    f.complete();
+    const auto completeBefore = f.state();
+    rejects([&] { f.deliver(Message(MessageType::Handshake, payload)); });
+    checkUnchanged(f.state(), completeBefore);
+}
+
+void ordinaryMessagesRequireHandshake()
+{
+    HandshakeFixture f;
+    const std::vector<Message> messages{
+        Message(MessageType::Choke), Message(MessageType::Unchoke),
+        Message(MessageType::Interested), Message(MessageType::NotInterested),
+        Message(MessageType::Have, HavePayload{8}),
+        Message(MessageType::Bitfield, BitfieldPayload{{0x01, 0x80}})
+    };
+    for (bool existingConnection : {false, true}) {
+        if (existingConnection) f.deliver(Message(MessageType::Request, RequestPayload{}));
+        const auto before = f.state();
+        for (const auto& message : messages) {
+            rejects([&] { f.deliver(message); });
+            checkUnchanged(f.state(), before);
+        }
+    }
+    f.complete();
+    for (const auto& message : messages) f.deliver(message);
+    check(f.state().connections.at(1).handshakeComplete);
+    check(!f.state().connections.at(1).remoteChokingUs);
+    check(!f.state().connections.at(1).remoteInterestedInUs);
+    check(f.state().connections.at(1).remoteBitfield == std::vector<std::uint8_t>({0x01, 0x80}));
+}
+
+void handshakeScope()
+{
+    HandshakeFixture f;
+    f.complete();
+    const auto before = f.state();
+    rejects([&] { f.network.deliver(1, 3, 2, Message(MessageType::Unchoke)); });
+    rejects([&] { f.network.deliver(2, 1, 2, Message(MessageType::Unchoke)); });
+    rejects([&] { f.network.deliver(1, 2, 1, Message(MessageType::Unchoke)); });
+    checkUnchanged(f.state(), before);
+    check(f.network.peer(2).swarmState(2).connections.empty());
+    check(f.network.peer(1).swarmState(1).connections.empty());
+}
+
+void handshakeUnjoinedSwarm()
+{
+    const Swarm swarm(1, InfoHash{0x77}, 9);
+    Peer sender(1, 1000, 1000, testSenderProtocolId);
+    Peer receiver(2);
+    Simulation simulation;
+    Network network(simulation, {sender, receiver}, {}, {swarm});
+    rejects([&] { network.deliver(1, 1, 2, handshake(swarm)); });
+    check(!network.peer(2).hasSwarm(1));
+}
+
+void handshakeRequiresSenderContext()
+{
+    Fixture f(false);
+    const auto before = f.receiver.swarmState(1);
+    rejects([&] { f.receive(handshake(f.swarm)); });
+    checkUnchanged(f.receiver.swarmState(1), before);
+    HandshakeFixture n;
+    rejects([&] { n.network.deliver(1, 99, 2, handshake(n.swarm)); });
+    check(n.state().connections.empty());
+}
+
+class ObserveHandshakeEvent : public Event {
+public:
+    ObserveHandshakeEvent(double time, const Network& network, bool expected, int& observations)
+        : Event(time), network_(network), expected_(expected), observations_(observations) {}
+    void execute() override {
+        const auto& connections = network_.peer(2).swarmState(1).connections;
+        if (expected_) check(connections.at(1).handshakeComplete);
+        else check(connections.empty());
+        ++observations_;
+    }
+private:
+    const Network& network_;
+    bool expected_;
+    int& observations_;
+};
+
+void handshakeArrivalTiming()
+{
+    HandshakeFixture f;
+    int observations = 0;
+    check(handshake(f.swarm).wireSize() == 68);
+    f.simulation.schedule(std::make_unique<SendMessageEvent>(
+        0.0, f.network, 1, 1, 2, handshake(f.swarm)));
+    // Arrival is 0.1 + 68 * 8 / 500 = 1.188 simulation seconds.
+    f.simulation.schedule(std::make_unique<ObserveHandshakeEvent>(0.0, f.network, false, observations));
+    f.simulation.schedule(std::make_unique<ObserveHandshakeEvent>(1.187, f.network, false, observations));
+    f.simulation.schedule(std::make_unique<ObserveHandshakeEvent>(1.189, f.network, true, observations));
+    f.simulation.schedule(std::make_unique<SendMessageEvent>(
+        2.0, f.network, 1, 1, 2, Message(MessageType::Unchoke)));
+    check(f.state().connections.empty());
+    f.simulation.run();
+    check(observations == 3);
+    check(f.state().connections.at(1).handshakeComplete);
+    check(!f.state().connections.at(1).remoteChokingUs);
+    check(std::abs(f.simulation.currentTime() - 2.18) < 1e-12);
+}
 } // namespace
 
 int main()
 {
     struct Test { const char* name; void (*run)(); };
     const Test tests[] = {
+        {"Valid handshake and subsequent UNCHOKE", validHandshake},
+        {"Wrong handshake infoHash", [] { invalidHandshake(true); }},
+        {"Wrong handshake PeerProtocolId", [] { invalidHandshake(false); }},
+        {"All ordinary messages require handshake", ordinaryMessagesRequireHandshake},
+        {"Handshake scope: receiver, swarm, remote", handshakeScope},
+        {"Handshake for unjoined swarm", handshakeUnjoinedSwarm},
+        {"Handshake requires actual sender context", handshakeRequiresSenderContext},
+        {"Handshake end-to-end arrival timing", handshakeArrivalTiming},
         {"UNCHOKE", unchoke}, {"CHOKE", choke},
         {"INTERESTED", interested}, {"NOT_INTERESTED", notInterested},
         {"HAVE bit positions and preservation", have},
