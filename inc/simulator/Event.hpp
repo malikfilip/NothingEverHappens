@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace simulator {
 
@@ -10,6 +11,7 @@ namespace simulator {
         virtual ~Event() = default;
 
         virtual void execute() = 0;
+        virtual std::string traceDescription() const { return "EVENT"; }
 
         double time() const { return time_; }
         std::uint64_t sequence() const { return sequence_; }

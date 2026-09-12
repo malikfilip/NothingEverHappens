@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -10,7 +11,13 @@ namespace simulator {
 
     class Simulation {
     public:
-        Simulation();
+        explicit Simulation(bool tracing = false);
+        void setTracing(bool enabled) { tracing_ = enabled; }
+        // Called just before execution; the event reference is valid only during the callback.
+        void setEventObserver(std::function<void(const Event&)> observer);
+        // Dispatch an immediate event through the same tracing/observer path as run().
+        // Its timestamp must equal currentTime().
+        void executeNow(Event& event);
 
         void schedule(std::unique_ptr<Event> event);
 
@@ -19,6 +26,9 @@ namespace simulator {
         double currentTime() const;
 
     private:
+        void executeEvent(Event& event);
+        bool tracing_;
+        std::function<void(const Event&)> event_observer_;
         double current_time_;
         std::uint64_t next_sequence_;
 

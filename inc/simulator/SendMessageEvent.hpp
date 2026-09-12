@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "simulator/Event.hpp"
+#include "simulator/MessageEventTrace.hpp"
 #include "simulator/Message.hpp"
 #include "simulator/Network.hpp"
 #include "simulator/Peer.hpp"
@@ -12,13 +13,18 @@ namespace simulator {
 
     class SendMessageEvent : public Event {
     public:
-        // Network must outlive the scheduled event.
+        // Requests enqueueing; this does not imply transmission has begun.
         SendMessageEvent(double time, Network& network, SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
             : Event(time), network_(network), swarmId_(swarmId), sender_(sender), receiver_(receiver),
               message_(std::move(message))
         {
         }
 
+        MessageEventDetails details() const { return {swarmId_, sender_, receiver_, message_.type()}; }
+        std::string traceDescription() const override
+        {
+            return describeMessageEvent("SEND_REQUEST", details());
+        }
         void execute() override
         {
             network_.send(swarmId_, sender_, receiver_, std::move(message_));

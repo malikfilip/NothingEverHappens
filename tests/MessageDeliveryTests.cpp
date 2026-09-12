@@ -7,6 +7,9 @@
 #include "simulator/Network.hpp"
 #include "simulator/SendMessageEvent.hpp"
 #include "simulator/Simulation.hpp"
+#include "simulator/TransmissionStartEvent.hpp"
+#include "simulator/TransmissionCompleteEvent.hpp"
+#include "simulator/MessageArrivalEvent.hpp"
 
 using namespace simulator;
 
@@ -646,6 +649,129 @@ void simultaneousHandshakeBitfields()
     f.checkExchange(1);
     check(std::abs(f.simulation.currentTime() - 1.4) < 1e-12);
 }
+enum class ExecutedKind { Request, Start, Complete, Arrival };
+struct ExecutedMessage {
+    ExecutedKind kind;
+    double time;
+    MessageEventDetails details;
+    unsigned bitfieldByte = 0;
+};
+
+void observeMessages(Simulation& simulation, std::vector<ExecutedMessage>& events)
+{
+    simulation.setEventObserver([&events](const Event& event) {
+        if (const auto* request = dynamic_cast<const SendMessageEvent*>(&event)) {
+            events.push_back({ExecutedKind::Request, event.time(), request->details()});
+        } else if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event)) {
+            unsigned byte = 0;
+            if (start->message().type() == MessageType::Bitfield) {
+                byte = std::get<BitfieldPayload>(start->message().payload()).bytes.at(0);
+            }
+            events.push_back({ExecutedKind::Start, event.time(), start->details(), byte});
+        } else if (const auto* complete = dynamic_cast<const TransmissionCompleteEvent*>(&event)) {
+            check(complete->details().has_value());
+            events.push_back({ExecutedKind::Complete, event.time(), *complete->details()});
+        } else if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event)) {
+            events.push_back({ExecutedKind::Arrival, event.time(), arrival->details()});
+        }
+    });
+}
+
+void checkEventTimes(const std::vector<ExecutedMessage>& events, PeerId sender,
+                     MessageType type, double request, double start, double complete, double arrival)
+{
+    const std::vector<ExecutedKind> kinds{
+        ExecutedKind::Request, ExecutedKind::Start, ExecutedKind::Complete, ExecutedKind::Arrival};
+    const std::vector<double> times{request, start, complete, arrival};
+    std::size_t matched = 0;
+    for (const auto& event : events) {
+        if (event.details.sender != sender || event.details.messageType != type) continue;
+        check(matched < kinds.size());
+        check(event.kind == kinds[matched]);
+        check(std::abs(event.time - times[matched]) < 1e-12);
+        check(event.details.swarmId == 1);
+        check(event.details.receiver == (sender == 1 ? 2 : 1));
+        ++matched;
+    }
+    check(matched == kinds.size());
+}
+
+void exactTransmissionEventTimes()
+{
+    QueueFixture f(0.1);
+    std::vector<ExecutedMessage> events;
+    observeMessages(f.simulation, events);
+    // 230 bytes at 800 bits/sec occupy A -> B from 5.0 through 7.3.
+    f.send(5.0, 1, Message(MessageType::Piece, PiecePayload{0, 0, 217}));
+    f.send(5.1, 1, Message(MessageType::Have, HavePayload{7}));
+    f.simulation.run();
+    checkEventTimes(events, 1, MessageType::Piece, 5.0, 5.0, 7.3, 7.4);
+    checkEventTimes(events, 1, MessageType::Have, 5.1, 7.3, 7.39, 7.49);
+    check(f.remote().remoteBitfield[0] == 1);
+    check(!f.network.transmissionState(1, 2).active);
+}
+
+void fifoTransmissionStartEvents()
+{
+    QueueFixture f;
+    std::vector<ExecutedMessage> events;
+    observeMessages(f.simulation, events);
+    for (unsigned i = 0; i < 31; ++i) {
+        f.send(i == 0 ? 5.0 : 5.01, 2, Message(MessageType::Bitfield,
+            BitfieldPayload{{static_cast<std::uint8_t>(i + 1)}}));
+    }
+    f.simulation.run();
+    unsigned requests = 0, starts = 0, completions = 0, arrivals = 0;
+    for (const auto& event : events) {
+        check(event.details.sender == 2 && event.details.receiver == 1);
+        if (event.kind == ExecutedKind::Request) {
+            check(std::abs(event.time - (requests == 0 ? 5.0 : 5.01)) < 1e-12);
+            ++requests;
+        } else if (event.kind == ExecutedKind::Start) {
+            check(event.bitfieldByte == starts + 1);
+            check(std::abs(event.time - (5.0 + starts * 0.06)) < 1e-12);
+            ++starts;
+        } else if (event.kind == ExecutedKind::Complete) {
+            ++completions;
+            check(std::abs(event.time - (5.0 + completions * 0.06)) < 1e-12);
+        } else {
+            ++arrivals;
+            check(std::abs(event.time - (6.0 + arrivals * 0.06)) < 1e-12);
+        }
+    }
+    check(requests == 31 && starts == 31 && completions == 31 && arrivals == 31);
+    check(f.remote(1).remoteBitfield[0] == 31);
+    check(!f.network.transmissionState(2, 1).active);
+    check(f.network.transmissionState(2, 1).pendingCount == 0);
+}
+
+void simultaneousTransmissionStartEvents()
+{
+    QueueFixture f;
+    std::vector<ExecutedMessage> events;
+    observeMessages(f.simulation, events);
+    f.send(5, 1, Message(MessageType::Have, HavePayload{0}));
+    f.send(5, 2, Message(MessageType::Have, HavePayload{7}));
+    f.simulation.run();
+    checkEventTimes(events, 1, MessageType::Have, 5, 5, 5.09, 6.09);
+    checkEventTimes(events, 2, MessageType::Have, 5, 5, 5.09, 6.09);
+}
+
+void automaticProtocolEventFlow()
+{
+    AutoBitfieldFixture f;
+    std::vector<ExecutedMessage> events;
+    observeMessages(f.simulation, events);
+    f.simulation.schedule(std::make_unique<SendMessageEvent>(
+        0, f.network, 1, 2, 1, Message(MessageType::Piece, PiecePayload{0, 0, 112})));
+    f.initiate(f.swarm);
+    f.simulation.run();
+    checkEventTimes(events, 1, MessageType::Handshake, 0, 0, 1.088, 1.188);
+    checkEventTimes(events, 2, MessageType::Handshake, 1.188, 2.0, 3.088, 3.188);
+    checkEventTimes(events, 2, MessageType::Bitfield, 2.0, 3.088, 3.2, 3.3);
+    checkEventTimes(events, 1, MessageType::Bitfield, 3.188, 3.188, 3.3, 3.4);
+    f.checkExchange(1);
+}
 void twoWayHandshakeLifecycle()
 {
     HandshakeFixture f;
@@ -870,6 +996,10 @@ int main()
 {
     struct Test { const char* name; void (*run)(); };
     const Test tests[] = {
+        {"Exact request/start/completion/arrival event times", exactTransmissionEventTimes},
+        {"FIFO start events for a 31-message burst", fifoTransmissionStartEvents},
+        {"Simultaneous full-duplex start events", simultaneousTransmissionStartEvents},
+        {"Automatic handshake and BITFIELD use all four events", automaticProtocolEventFlow},
         {"Automatic BITFIELD exchange, FIFO timing and duplicates", automaticBitfieldExchange},
         {"Automatic BITFIELD scope by swarm and remote peer", automaticBitfieldScope},
         {"Receiving BITFIELD never triggers a response", bitfieldDoesNotTriggerResponse},

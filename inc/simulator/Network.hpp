@@ -11,6 +11,7 @@ namespace simulator {
 
     class Simulation;
     class TransmissionCompleteEvent;
+    class TransmissionStartEvent;
 
     class Network {
     public:
@@ -37,6 +38,8 @@ namespace simulator {
 
     private:
         friend class TransmissionCompleteEvent;
+        friend class TransmissionStartEvent;
+        void beginTransmission(QueuedTransmission transmission);
         void sendInitialBitfield(Peer& sender, SwarmId swarmId, PeerId receiver);
         std::size_t linkIndex(PeerId sender, PeerId receiver) const;
         void startTransmission(std::size_t linkIndex, PeerId sender);

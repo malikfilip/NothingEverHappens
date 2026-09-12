@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "simulator/Event.hpp"
+#include "simulator/MessageEventTrace.hpp"
 #include "simulator/Message.hpp"
 #include "simulator/Network.hpp"
 #include "simulator/Peer.hpp"
@@ -18,6 +19,11 @@ namespace simulator {
         {
         }
 
+        MessageEventDetails details() const { return {swarmId_, sender_, receiver_, message_.type()}; }
+        std::string traceDescription() const override
+        {
+            return describeMessageEvent("MESSAGE_ARRIVAL", details());
+        }
         void execute() override
         {
             network_.deliver(swarmId_, sender_, receiver_, message_);

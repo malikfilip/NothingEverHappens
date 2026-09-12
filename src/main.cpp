@@ -13,7 +13,7 @@ int main()
     sender.joinSwarm(swarm);
     receiver.joinSwarm(swarm);
 
-    simulator::Simulation simulation;
+    simulator::Simulation simulation(true);
     simulator::Network network(simulation, {sender, receiver},
         {simulator::Link(1, 2, 800.0, 0.1)}, {swarm});
     simulation.schedule(std::make_unique<simulator::SendMessageEvent>(

@@ -10,6 +10,7 @@
 #include "simulator/SendMessageEvent.hpp"
 #include "simulator/Simulation.hpp"
 #include "simulator/TransmissionCompleteEvent.hpp"
+#include "simulator/TransmissionStartEvent.hpp"
 
 namespace simulator {
 
@@ -61,8 +62,10 @@ namespace simulator {
                         && transmission.message.type() == MessageType::Handshake;
                 });
             if (!queued) {
-                send(swarmId, receiver, sender, Message(MessageType::Handshake,
-                    HandshakePayload{currentSwarm.infoHash(), to->protocolId()}));
+                SendMessageEvent response(simulation_.currentTime(), *this, swarmId, receiver, sender,
+                    Message(MessageType::Handshake,
+                        HandshakePayload{currentSwarm.infoHash(), to->protocolId()}));
+                simulation_.executeNow(response);
             }
         }
         if (message.type() == MessageType::Handshake) {
@@ -130,6 +133,20 @@ namespace simulator {
         // Only the front message is considered. No timing is assigned while queued.
         auto transmission = std::move(direction.pending.front());
         direction.pending.pop_front();
+        TransmissionStartEvent event(simulation_.currentTime(), *this, transmission.swarmId,
+            transmission.sender, transmission.receiver, std::move(transmission.message));
+        simulation_.executeNow(event);
+    }
+
+    void Network::beginTransmission(QueuedTransmission transmission)
+    {
+        const auto sender = transmission.sender;
+        const auto index = linkIndex(sender, transmission.receiver);
+        auto& link = links_[index];
+        auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
+        if (direction.active) {
+            throw std::logic_error("Cannot start a transmission on a busy direction");
+        }
         const auto& to = peer(transmission.receiver);
         const auto from = std::find_if(peers_.begin(), peers_.end(),
             [sender](const Peer& candidate) { return candidate.id() == sender; });
@@ -156,7 +173,9 @@ namespace simulator {
         }
         direction.active = true;
         simulation_.schedule(std::make_unique<TransmissionCompleteEvent>(
-            completionTime, *this, index, sender));
+            completionTime, *this, index, sender,
+            MessageEventDetails{transmission.swarmId, sender,
+                transmission.receiver, transmission.message.type()}));
         simulation_.schedule(std::make_unique<MessageArrivalEvent>(
             arrivalTime, *this, transmission.swarmId, transmission.sender,
             transmission.receiver, std::move(transmission.message)));
