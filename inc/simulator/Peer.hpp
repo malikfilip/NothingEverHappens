@@ -15,13 +15,15 @@ namespace simulator {
     class Message;
 
     struct PeerConnectionState {
-        bool remoteChokingUs = true;
+        bool remoteIsChokingUs = true;
         bool remoteInterestedInUs = false;
         std::vector<std::uint8_t> remoteBitfield;
         bool handshakeSent = false;
         bool handshakeReceived = false;
         // True once the automatic BITFIELD has been scheduled (it may still be queued).
         bool bitfieldSent = false;
+        bool weAreInterestedInRemote = false;
+        bool weAreChokingRemote = true;
 
         bool handshakeComplete() const { return handshakeSent && handshakeReceived; }
     };
@@ -45,6 +47,8 @@ namespace simulator {
 
         // Throws std::invalid_argument if this SwarmId is already joined.
         void joinSwarm(const Swarm& swarm);
+        // Initializes owned pieces; rejects invalid length or unused trailing bits.
+        void joinSwarm(const Swarm& swarm, std::vector<std::uint8_t> localBitfield);
         // Throws std::invalid_argument for invalid handshakes, unjoined swarms,
         // ordinary messages before handshake, or invalid HAVE/BITFIELD.
         // Handshakes require the actual sender identity supplied by Network.
@@ -58,6 +62,8 @@ namespace simulator {
 
     private:
         friend class Network;
+        static bool hasUsefulPieces(const Swarm& swarm, const PeerSwarmState& state,
+                                    const PeerConnectionState& remote);
         std::uint32_t id_;
         PeerProtocolId protocol_id_;
         double upload_capacity_;

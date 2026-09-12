@@ -10,7 +10,7 @@ int main()
     const simulator::Swarm swarm(1, simulator::InfoHash{1}, 9);
     simulator::Peer sender(1, 1000.0, 2000.0, simulator::PeerProtocolId{0xa1});
     simulator::Peer receiver(2, 2000.0, 500.0, simulator::PeerProtocolId{0xb2});
-    sender.joinSwarm(swarm);
+    sender.joinSwarm(swarm, {0x80, 0}); // Peer 1 initially owns piece 0.
     receiver.joinSwarm(swarm);
 
     simulator::Simulation simulation(true);
@@ -39,5 +39,10 @@ int main()
     printBitfield("Peer 1 stores peer 2 bitfield:", aToB.remoteBitfield);
     printBitfield("Peer 2 stores peer 1 bitfield:", bToA.remoteBitfield);
     std::cout << "Final simulation time: " << simulation.currentTime() << " seconds\n";
-    return complete && exchanged ? 0 : 1;
+    std::cout << "Peer 2 is interested in peer 1: " << bToA.weAreInterestedInRemote << '\n'
+              << "Peer 1 received peer 2 interest: " << aToB.remoteInterestedInUs << '\n';
+    std::cout << "Peer 1 is choking peer 2: " << aToB.weAreChokingRemote << '\n'
+              << "Peer 2 sees peer 1 choking it: " << bToA.remoteIsChokingUs << '\n';
+    return complete && exchanged && bToA.weAreInterestedInRemote && aToB.remoteInterestedInUs
+        && !aToB.weAreChokingRemote && !bToA.remoteIsChokingUs ? 0 : 1;
 }

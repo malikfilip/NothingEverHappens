@@ -1,6 +1,7 @@
 #include "simulator/Peer.hpp"
 
 #include <stdexcept>
+#include <utility>
 
 #include "simulator/Swarm.hpp"
 #include "simulator/Message.hpp"
@@ -34,14 +35,37 @@ namespace simulator {
 
     void Peer::joinSwarm(const Swarm& swarm)
     {
+        const auto byteCount = swarm.pieceCount() / 8 + (swarm.pieceCount() % 8 != 0);
+        joinSwarm(swarm, std::vector<std::uint8_t>(byteCount, 0));
+    }
+
+    void Peer::joinSwarm(const Swarm& swarm, std::vector<std::uint8_t> localBitfield)
+    {
         if (hasSwarm(swarm.id())) {
             throw std::invalid_argument("Peer has already joined this SwarmId");
         }
         const auto byteCount = swarm.pieceCount() / 8 + (swarm.pieceCount() % 8 != 0);
-        swarm_states_.emplace(swarm.id(), PeerSwarmState{
-            std::vector<std::uint8_t>(byteCount, 0), {}});
+        const auto remainder = swarm.pieceCount() % 8;
+        if (localBitfield.size() != byteCount
+            || (remainder != 0 && (localBitfield.back() & ((1u << (8 - remainder)) - 1u)) != 0)) {
+            throw std::invalid_argument("Invalid initial local bitfield");
+        }
+        swarm_states_.emplace(swarm.id(), PeerSwarmState{std::move(localBitfield), {}});
     }
 
+    bool Peer::hasUsefulPieces(const Swarm& swarm, const PeerSwarmState& state,
+                               const PeerConnectionState& remote)
+    {
+        // Iterate only real pieces, excluding unused trailing bits.
+        for (std::uint32_t piece = 0; piece < swarm.pieceCount(); ++piece) {
+            const auto mask = 0x80u >> (piece % 8);
+            if ((remote.remoteBitfield[piece / 8] & mask) != 0
+                && (state.localBitfield[piece / 8] & mask) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
     void Peer::receiveMessage(const Swarm& swarm, PeerId sender, const Message& message, const PeerProtocolId* senderProtocolId)
     {
         const auto state = swarm_states_.find(swarm.id());
@@ -102,16 +126,18 @@ namespace simulator {
         auto& remote = connection->second;
         switch (message.type()) {
         case MessageType::Choke:
-            remote.remoteChokingUs = true;
+            remote.remoteIsChokingUs = true;
             break;
         case MessageType::Unchoke:
-            remote.remoteChokingUs = false;
+            remote.remoteIsChokingUs = false;
             break;
         case MessageType::Interested:
             remote.remoteInterestedInUs = true;
+            remote.weAreChokingRemote = false;
             break;
         case MessageType::NotInterested:
             remote.remoteInterestedInUs = false;
+            remote.weAreChokingRemote = true;
             break;
         case MessageType::Bitfield:
             remote.remoteBitfield = std::get<BitfieldPayload>(message.payload()).bytes;
@@ -129,6 +155,9 @@ namespace simulator {
         case MessageType::Cancel:
             // Protocol handling is not implemented yet.
             break;
+        }
+        if (message.type() == MessageType::Bitfield || message.type() == MessageType::Have) {
+            remote.weAreInterestedInRemote = hasUsefulPieces(swarm, state->second, remote);
         }
     }
 

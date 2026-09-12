@@ -51,7 +51,36 @@ namespace simulator {
             senderProtocolId = &peer(sender).protocolId();
         }
         const auto& currentSwarm = swarm(swarmId);
+        const bool availability = message.type() == MessageType::Bitfield || message.type() == MessageType::Have;
+        const bool interestMessage = message.type() == MessageType::Interested
+            || message.type() == MessageType::NotInterested;
+        bool wasChoking = true;
+        bool wasInterested = false;
+        if ((availability || interestMessage) && to->hasSwarm(swarmId)) {
+            const auto& connections = to->swarmState(swarmId).connections;
+            const auto connection = connections.find(sender);
+            if (connection != connections.end()) {
+                wasInterested = connection->second.weAreInterestedInRemote;
+                wasChoking = connection->second.weAreChokingRemote;
+            }
+        }
         to->receiveMessage(currentSwarm, sender, message, senderProtocolId);
+        if (interestMessage) {
+            const bool choking = to->swarmState(swarmId).connections.at(sender).weAreChokingRemote;
+            if (choking != wasChoking) {
+                simulation_.schedule(std::make_unique<SendMessageEvent>(
+                    simulation_.currentTime(), *this, swarmId, receiver, sender,
+                    Message(choking ? MessageType::Choke : MessageType::Unchoke)));
+            }
+        }
+        if (availability) {
+            const bool interested = to->swarmState(swarmId).connections.at(sender).weAreInterestedInRemote;
+            if (interested != wasInterested) {
+                simulation_.schedule(std::make_unique<SendMessageEvent>(
+                    simulation_.currentTime(), *this, swarmId, receiver, sender,
+                    Message(interested ? MessageType::Interested : MessageType::NotInterested)));
+            }
+        }
         if (message.type() == MessageType::Handshake
             && !to->swarmState(swarmId).connections.at(sender).handshakeSent) {
             const auto& link = links_[linkIndex(receiver, sender)];

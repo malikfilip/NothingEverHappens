@@ -1,4 +1,5 @@
 #include <cmath>
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -60,12 +61,12 @@ int existingDeliveryRegression()
         check(receiver.swarmState(1).connections.empty());
         establishHandshake(receiver, swarm);
         receive(Message(MessageType::Choke));
-        check(remote().remoteChokingUs && !remote().remoteInterestedInUs);
+        check(remote().remoteIsChokingUs && !remote().remoteInterestedInUs);
         check(remote().remoteBitfield == std::vector<std::uint8_t>({0, 0}));
         receive(Message(MessageType::Unchoke));
-        check(!remote().remoteChokingUs);
+        check(!remote().remoteIsChokingUs);
         receive(Message(MessageType::Choke));
-        check(remote().remoteChokingUs);
+        check(remote().remoteIsChokingUs);
         receive(Message(MessageType::Interested));
         check(remote().remoteInterestedInUs);
         receive(Message(MessageType::NotInterested));
@@ -98,7 +99,7 @@ int existingDeliveryRegression()
                 Message(MessageType::Cancel, CancelPayload{})}) {
             receive(message);
         }
-        check(remote().remoteChokingUs && !remote().remoteInterestedInUs);
+        check(remote().remoteIsChokingUs && !remote().remoteInterestedInUs);
         check(remote().remoteBitfield == std::vector<std::uint8_t>({0x40, 0}));
 
         Peer sender(1, 1000, 1000, testSenderProtocolId);
@@ -110,11 +111,11 @@ int existingDeliveryRegression()
         rejects([&] { network.deliver(2, 2, 1, Message(MessageType::Unchoke)); });
         simulation.schedule(std::make_unique<SendMessageEvent>(
             2.0, network, 1, 1, 2, Message(MessageType::Unchoke)));
-        check(network.peer(2).swarmState(1).connections.at(1).remoteChokingUs);
+        check(network.peer(2).swarmState(1).connections.at(1).remoteIsChokingUs);
         simulation.run();
-        check(!network.peer(2).swarmState(1).connections.at(1).remoteChokingUs);
+        check(!network.peer(2).swarmState(1).connections.at(1).remoteIsChokingUs);
         check(std::abs(simulation.currentTime() - 2.18) < 1e-12);
-        check(network.peer(2).swarmState(2).connections.at(1).remoteChokingUs);
+        check(network.peer(2).swarmState(2).connections.at(1).remoteIsChokingUs);
         std::cout << "Message delivery tests passed\n"; return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
@@ -153,8 +154,10 @@ void checkUnchanged(const PeerSwarmState& actual, const PeerSwarmState& before)
         check(connection.handshakeSent == expected.handshakeSent);
         check(connection.handshakeReceived == expected.handshakeReceived);
         check(connection.bitfieldSent == expected.bitfieldSent);
+        check(connection.weAreInterestedInRemote == expected.weAreInterestedInRemote);
         check(connection.handshakeComplete() == expected.handshakeComplete());
-        check(connection.remoteChokingUs == expected.remoteChokingUs);
+        check(connection.remoteIsChokingUs == expected.remoteIsChokingUs);
+        check(connection.weAreChokingRemote == expected.weAreChokingRemote);
         check(connection.remoteInterestedInUs == expected.remoteInterestedInUs);
         check(connection.remoteBitfield == expected.remoteBitfield);
     }
@@ -164,18 +167,18 @@ void unchoke()
 {
     Fixture f;
     f.receive(Message(MessageType::Choke));
-    check(f.remote().remoteChokingUs);
+    check(f.remote().remoteIsChokingUs);
     f.receive(Message(MessageType::Unchoke));
-    check(!f.remote().remoteChokingUs);
+    check(!f.remote().remoteIsChokingUs);
 }
 
 void choke()
 {
     Fixture f;
     f.receive(Message(MessageType::Unchoke));
-    check(!f.remote().remoteChokingUs);
+    check(!f.remote().remoteIsChokingUs);
     f.receive(Message(MessageType::Choke));
-    check(f.remote().remoteChokingUs);
+    check(f.remote().remoteIsChokingUs);
 }
 
 void interested()
@@ -236,7 +239,7 @@ void bitfield()
                              std::vector<std::uint8_t>{0, 0}}) {
         f.receive(Message(MessageType::Bitfield, BitfieldPayload{bytes}));
         check(f.remote().remoteBitfield == bytes);
-        check(!f.remote().remoteChokingUs && f.remote().remoteInterestedInUs);
+        check(!f.remote().remoteIsChokingUs && f.remote().remoteInterestedInUs);
     }
     const Swarm aligned(2, {}, 8);
     f.receiver.joinSwarm(aligned);
@@ -290,7 +293,7 @@ public:
     ObserveChokingEvent(double time, const Network& network, bool expected, int& observations)
         : Event(time), network_(network), expected_(expected), observations_(observations) {}
     void execute() override {
-        check(network_.peer(2).swarmState(1).connections.at(1).remoteChokingUs == expected_);
+        check(network_.peer(2).swarmState(1).connections.at(1).remoteIsChokingUs == expected_);
         ++observations_;
     }
 private:
@@ -315,10 +318,10 @@ void arrivalTiming()
     // Arrival is 2 + 0.1 latency + 5 * 8 / 500 transmission = 2.18.
     simulation.schedule(std::make_unique<ObserveChokingEvent>(2.179, network, true, observations));
     simulation.schedule(std::make_unique<ObserveChokingEvent>(2.181, network, false, observations));
-    check(network.peer(2).swarmState(1).connections.at(1).remoteChokingUs);
+    check(network.peer(2).swarmState(1).connections.at(1).remoteIsChokingUs);
     simulation.run();
     check(observations == 3);
-    check(!network.peer(2).swarmState(1).connections.at(1).remoteChokingUs);
+    check(!network.peer(2).swarmState(1).connections.at(1).remoteIsChokingUs);
 }
 struct HandshakeFixture {
     Swarm swarm{1, InfoHash{0x13, 0x57}, 9};
@@ -365,8 +368,9 @@ struct QueueFixture {
     explicit QueueFixture(double latency = 1.0)
         : network(simulation, joinedPeers(), {Link(1, 2, 800, latency)}, {swarm}) {}
     std::vector<Peer> joinedPeers() {
-        a.joinSwarm(swarm);
-        b.joinSwarm(swarm);
+        // Transport-only fixture: all pieces owned, so availability adds no interest traffic.
+        a.joinSwarm(swarm, {0xff});
+        b.joinSwarm(swarm, {0xff});
         a.markHandshakeSent(swarm, 2);
         b.markHandshakeSent(swarm, 1);
         a.receiveMessage(swarm, 2, handshake(swarm, b.protocolId()), &b.protocolId());
@@ -395,21 +399,21 @@ void serializedTransmissionAndLatency()
     f.observe(0.049, [&] {
         const auto state = f.network.transmissionState(1, 2);
         check(state.active && state.pendingCount == 1);
-        check(f.remote().remoteChokingUs);
+        check(f.remote().remoteIsChokingUs);
     });
     f.observe(0.051, [&] {
         const auto state = f.network.transmissionState(1, 2);
         check(state.active && state.pendingCount == 0); // Second started at 0.05.
-        check(f.remote().remoteChokingUs); // First has not arrived.
+        check(f.remote().remoteIsChokingUs); // First has not arrived.
     });
     f.observe(0.141, [&] {
         check(!f.network.transmissionState(1, 2).active);
-        check(f.remote().remoteChokingUs);
+        check(f.remote().remoteIsChokingUs);
         check(f.remote().remoteBitfield[0] == 0);
     });
-    f.observe(1.049, [&] { check(f.remote().remoteChokingUs); });
+    f.observe(1.049, [&] { check(f.remote().remoteIsChokingUs); });
     f.observe(1.051, [&] {
-        check(!f.remote().remoteChokingUs);
+        check(!f.remote().remoteIsChokingUs);
         check(f.remote().remoteBitfield[0] == 0);
     });
     f.observe(1.139, [&] { check(f.remote().remoteBitfield[0] == 0); });
@@ -590,8 +594,8 @@ void automaticBitfieldExchange()
     }));
     f.simulation.run();
     f.checkExchange(1);
-    // Exactly one 7-byte BITFIELD per direction: B arrives at 2.488, A at 2.588.
-    check(std::abs(f.simulation.currentTime() - 2.588) < 1e-12);
+    // BITFIELDs arrive at 2.488 and 2.588; interest announcements finish at 2.768.
+    check(std::abs(f.simulation.currentTime() - 2.948) < 1e-12);
 
     const auto aBefore = f.network.peer(1).swarmState(1);
     const auto bBefore = f.network.peer(2).swarmState(1);
@@ -647,7 +651,7 @@ void simultaneousHandshakeBitfields()
     f.initiate(f.swarm, 2, 1);
     f.simulation.run();
     f.checkExchange(1);
-    check(std::abs(f.simulation.currentTime() - 1.4) < 1e-12);
+    check(std::abs(f.simulation.currentTime() - 1.76) < 1e-12);
 }
 enum class ExecutedKind { Request, Start, Complete, Arrival };
 struct ExecutedMessage {
@@ -772,6 +776,258 @@ void automaticProtocolEventFlow()
     checkEventTimes(events, 1, MessageType::Bitfield, 3.188, 3.188, 3.3, 3.4);
     f.checkExchange(1);
 }
+struct InterestFixture {
+    Swarm swarm{1, InfoHash{0x11}, 9};
+    Swarm other{2, InfoHash{0x22}, 8};
+    Peer a{1, 1000, 1000, PeerProtocolId{0xa1}};
+    Peer b{2, 500, 500, PeerProtocolId{0xb2}};
+    Peer c{3, 1000, 1000, PeerProtocolId{0xc3}};
+    Simulation simulation;
+    Network network;
+    std::vector<ExecutedMessage> events;
+
+    InterestFixture()
+        : network(simulation, joinedPeers(), {Link(1, 2, 800, 0.1), Link(2, 3, 800, 0.1)},
+                  {swarm, other}) { observeMessages(simulation, events); }
+    std::vector<Peer> joinedPeers() {
+        for (Peer* peer : {&a, &b, &c}) {
+            peer->joinSwarm(swarm, peer == &b ? std::vector<std::uint8_t>{0x80, 0}
+                                             : std::vector<std::uint8_t>{0xff, 0x80});
+            peer->joinSwarm(other, peer == &b ? std::vector<std::uint8_t>{0x80}
+                                             : std::vector<std::uint8_t>{0xff});
+        }
+        for (const Swarm* current : {&swarm, &other}) {
+            for (Peer* remote : {&a, &c}) {
+                b.markHandshakeSent(*current, remote->id());
+                remote->markHandshakeSent(*current, b.id());
+                b.receiveMessage(*current, remote->id(), handshake(*current, remote->protocolId()),
+                                 &remote->protocolId());
+                remote->receiveMessage(*current, b.id(), handshake(*current, b.protocolId()), &b.protocolId());
+            }
+        }
+        return {a, b, c};
+    }
+    void receive(Message message, SwarmId swarmId = 1, PeerId sender = 1) {
+        network.deliver(swarmId, sender, 2, message);
+    }
+    const PeerConnectionState& local(SwarmId swarmId = 1, PeerId remote = 1) const {
+        return network.peer(2).swarmState(swarmId).connections.at(remote);
+    }
+    unsigned requests(MessageType type, SwarmId swarmId = 1, PeerId receiver = 1) const {
+        return static_cast<unsigned>(std::count_if(events.begin(), events.end(), [&](const auto& event) {
+            return event.kind == ExecutedKind::Request && event.details.messageType == type
+                && event.details.swarmId == swarmId && event.details.sender == 2
+                && event.details.receiver == receiver;
+        }));
+    }
+};
+
+void bitfieldInterestTransitions()
+{
+    InterestFixture f;
+    check(!PeerConnectionState{}.weAreInterestedInRemote);
+    f.receive(Message(MessageType::Bitfield, BitfieldPayload{{0x80, 0}})); // Already owned.
+    check(!f.local().weAreInterestedInRemote);
+    f.simulation.run();
+    check(f.events.empty());
+
+    f.receive(Message(MessageType::Bitfield, BitfieldPayload{{0x80, 0x80}})); // Missing piece 8.
+    check(f.local().weAreInterestedInRemote && !f.local().remoteInterestedInUs);
+    check(!f.network.peer(1).swarmState(1).connections.at(2).remoteInterestedInUs);
+    f.receive(Message(MessageType::Bitfield, BitfieldPayload{{0x80, 0x80}}));
+    f.receive(Message(MessageType::Bitfield, BitfieldPayload{{0x01, 0}}));
+    f.simulation.run();
+    check(f.requests(MessageType::Interested) == 1);
+    check(f.network.peer(1).swarmState(1).connections.at(2).remoteInterestedInUs);
+
+    f.receive(Message(MessageType::Interested));
+    f.receive(Message(MessageType::Bitfield, BitfieldPayload{{0x80, 0}}));
+    check(!f.local().weAreInterestedInRemote && f.local().remoteInterestedInUs);
+    f.receive(Message(MessageType::Bitfield, BitfieldPayload{{0, 0}}));
+    f.simulation.run();
+    check(f.requests(MessageType::NotInterested) == 1);
+    check(f.requests(MessageType::Interested) == 1);
+    check(!f.network.peer(1).swarmState(1).connections.at(2).remoteInterestedInUs);
+    check(f.local().remoteInterestedInUs); // The two interest directions are independent.
+}
+
+void haveInterestTransitions()
+{
+    InterestFixture f;
+    f.receive(Message(MessageType::Have, HavePayload{0})); // Owned locally.
+    check(!f.local().weAreInterestedInRemote);
+    f.receive(Message(MessageType::Have, HavePayload{8}));
+    check(f.local().weAreInterestedInRemote);
+    check(f.local().remoteBitfield == std::vector<std::uint8_t>({0x80, 0x80}));
+    f.receive(Message(MessageType::Have, HavePayload{8}));
+    f.receive(Message(MessageType::Have, HavePayload{7}));
+    f.simulation.run();
+    check(f.requests(MessageType::Interested) == 1);
+    check(f.requests(MessageType::NotInterested) == 0);
+    check(f.network.peer(1).swarmState(1).connections.at(2).remoteInterestedInUs);
+}
+
+void interestScope()
+{
+    InterestFixture f;
+    f.receive(Message(MessageType::Have, HavePayload{8}));
+    check(f.local().weAreInterestedInRemote);
+    check(!f.local(2).weAreInterestedInRemote);
+    check(!f.local(1, 3).weAreInterestedInRemote);
+    f.receive(Message(MessageType::Bitfield, BitfieldPayload{{0x40}}), 2);
+    f.receive(Message(MessageType::Have, HavePayload{7}), 1, 3);
+    f.simulation.run();
+    check(f.local(2).weAreInterestedInRemote && f.local(1, 3).weAreInterestedInRemote);
+    check(f.requests(MessageType::Interested) == 1);
+    check(f.requests(MessageType::Interested, 2) == 1);
+    check(f.requests(MessageType::Interested, 1, 3) == 1);
+    f.receive(Message(MessageType::Bitfield, BitfieldPayload{{0, 0}}));
+    f.simulation.run();
+    check(!f.local().weAreInterestedInRemote);
+    check(f.local(2).weAreInterestedInRemote && f.local(1, 3).weAreInterestedInRemote);
+    check(f.requests(MessageType::NotInterested) == 1);
+    check(f.requests(MessageType::NotInterested, 2) == 0);
+    check(f.requests(MessageType::NotInterested, 1, 3) == 0);
+}
+
+void interestUsesDirectionalFifo()
+{
+    InterestFixture f;
+    f.network.send(1, 2, 1, Message(MessageType::Piece, PiecePayload{0, 0, 112}));
+    f.receive(Message(MessageType::Have, HavePayload{8}));
+    f.receive(Message(MessageType::Bitfield, BitfieldPayload{{0, 0}}));
+    f.simulation.schedule(std::make_unique<CheckEvent>(0.001, [&] {
+        check(f.network.transmissionState(2, 1).pendingCount == 2);
+        check(!f.local().weAreInterestedInRemote);
+        check(!f.network.peer(1).swarmState(1).connections.at(2).remoteInterestedInUs);
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(2.181, [&] {
+        check(f.network.peer(1).swarmState(1).connections.at(2).remoteInterestedInUs);
+    }));
+    f.simulation.run();
+    checkEventTimes(f.events, 2, MessageType::Interested, 0, 2, 2.08, 2.18);
+    checkEventTimes(f.events, 2, MessageType::NotInterested, 0, 2.08, 2.16, 2.26);
+    check(!f.network.peer(1).swarmState(1).connections.at(2).remoteInterestedInUs);
+    check(!f.network.transmissionState(2, 1).active);
+}
+
+void invalidAvailabilityPreservesInterest()
+{
+    InterestFixture f;
+    for (bool interested : {false, true}) {
+        if (interested) {
+            f.receive(Message(MessageType::Have, HavePayload{8}));
+            f.simulation.run();
+        }
+        const auto before = f.network.peer(2).swarmState(1);
+        const auto count = f.events.size();
+        for (const auto& message : {
+                Message(MessageType::Have, HavePayload{9}),
+                Message(MessageType::Bitfield, BitfieldPayload{{0}}),
+                Message(MessageType::Bitfield, BitfieldPayload{{0, 1}})}) {
+            rejects([&] { f.receive(message); });
+            checkUnchanged(f.network.peer(2).swarmState(1), before);
+        }
+        f.simulation.run();
+        check(f.events.size() == count);
+    }
+}
+
+void initialLocalBitfield()
+{
+    const Swarm swarm(1, {}, 9);
+    Peer peer(1);
+    for (const auto& bytes : {std::vector<std::uint8_t>{}, std::vector<std::uint8_t>{0},
+                             std::vector<std::uint8_t>{0, 1}}) {
+        rejects([&] { peer.joinSwarm(swarm, bytes); });
+        check(!peer.hasSwarm(1));
+    }
+    peer.joinSwarm(swarm, {0x80, 0x80});
+    check(peer.swarmState(1).localBitfield == std::vector<std::uint8_t>({0x80, 0x80}));
+    rejects([&] { peer.joinSwarm(swarm, {0, 0}); });
+    check(peer.swarmState(1).localBitfield == std::vector<std::uint8_t>({0x80, 0x80}));
+}
+void chokePolicyAndArrival()
+{
+    InterestFixture f;
+    check(PeerConnectionState{}.weAreChokingRemote);
+    check(PeerConnectionState{}.remoteIsChokingUs);
+    f.receive(Message(MessageType::NotInterested)); // Initial no-op.
+    f.simulation.run();
+    check(f.events.empty());
+    f.receive(Message(MessageType::Interested));
+    f.receive(Message(MessageType::Interested));
+    check(!f.local().weAreChokingRemote);
+    check(f.local().remoteIsChokingUs); // Other direction remains choked.
+    check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
+    f.simulation.schedule(std::make_unique<CheckEvent>(0.081, [&] {
+        // Transmission completed at .08, but arrival is .18.
+        check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
+    }));
+    f.simulation.run();
+    checkEventTimes(f.events, 2, MessageType::Unchoke, 0, 0, .08, .18);
+    check(!f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
+    check(f.requests(MessageType::Unchoke) == 1);
+    f.receive(Message(MessageType::Interested));
+    f.simulation.run();
+    check(f.requests(MessageType::Unchoke) == 1);
+
+    f.receive(Message(MessageType::NotInterested));
+    f.receive(Message(MessageType::NotInterested));
+    check(f.local().weAreChokingRemote);
+    check(!f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
+    f.simulation.schedule(std::make_unique<CheckEvent>(.261, [&] {
+        check(!f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
+    }));
+    f.simulation.run();
+    checkEventTimes(f.events, 2, MessageType::Choke, .18, .18, .26, .36);
+    check(f.requests(MessageType::Choke) == 1);
+    check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
+}
+
+void chokePolicyScope()
+{
+    InterestFixture f;
+    f.receive(Message(MessageType::Interested));
+    f.simulation.run();
+    check(!f.local().weAreChokingRemote && f.local().remoteIsChokingUs);
+    check(f.local(2).weAreChokingRemote && f.local(1, 3).weAreChokingRemote);
+    check(f.network.peer(1).swarmState(1).connections.at(2).weAreChokingRemote);
+    f.receive(Message(MessageType::Interested), 2);
+    f.receive(Message(MessageType::Interested), 1, 3);
+    f.network.deliver(1, 2, 1, Message(MessageType::Interested)); // Reverse policy direction.
+    f.simulation.run();
+    check(!f.local().remoteIsChokingUs);
+    check(!f.local(2).weAreChokingRemote && !f.local(1, 3).weAreChokingRemote);
+    f.receive(Message(MessageType::NotInterested));
+    f.simulation.run();
+    check(f.local().weAreChokingRemote && !f.local().remoteIsChokingUs);
+    check(!f.local(2).weAreChokingRemote && !f.local(1, 3).weAreChokingRemote);
+    check(f.requests(MessageType::Unchoke) == 1);
+    check(f.requests(MessageType::Unchoke, 2) == 1);
+    check(f.requests(MessageType::Unchoke, 1, 3) == 1);
+    check(f.requests(MessageType::Choke) == 1);
+}
+
+void chokePolicyUsesFifo()
+{
+    InterestFixture f;
+    f.network.send(1, 2, 1, Message(MessageType::Piece, PiecePayload{0, 0, 112}));
+    f.receive(Message(MessageType::Interested));
+    f.receive(Message(MessageType::NotInterested));
+    f.receive(Message(MessageType::NotInterested));
+    f.simulation.schedule(std::make_unique<CheckEvent>(.001, [&] {
+        check(f.network.transmissionState(2, 1).pendingCount == 2);
+        check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(2.181, [&] {
+        check(!f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
+    }));
+    f.simulation.run();
+    checkEventTimes(f.events, 2, MessageType::Unchoke, 0, 2, 2.08, 2.18);
+    checkEventTimes(f.events, 2, MessageType::Choke, 0, 2.08, 2.16, 2.26);
+    check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
+}
 void twoWayHandshakeLifecycle()
 {
     HandshakeFixture f;
@@ -828,6 +1084,7 @@ void twoWayHandshakeLifecycle()
         f.network.deliver(1, 1, 2, message);
         f.network.deliver(1, 2, 1, message);
     }
+    f.simulation.run(); // Drain interest transitions caused by the ordinary messages above.
     const double finished = f.simulation.currentTime();
     f.deliver(handshake(f.swarm));
     f.simulation.run();
@@ -850,10 +1107,10 @@ void validHandshake()
     f.complete();
     const auto& remote = f.state().connections.at(1);
     check(remote.handshakeComplete());
-    check(remote.remoteChokingUs && !remote.remoteInterestedInUs);
+    check(remote.remoteIsChokingUs && !remote.remoteInterestedInUs);
     check(remote.remoteBitfield == std::vector<std::uint8_t>({0, 0}));
     f.deliver(Message(MessageType::Unchoke));
-    check(!f.state().connections.at(1).remoteChokingUs);
+    check(!f.state().connections.at(1).remoteIsChokingUs);
     const auto before = f.state();
     f.complete();
     checkUnchanged(f.state(), before);
@@ -914,7 +1171,7 @@ void ordinaryMessagesRequireHandshake()
     f.complete();
     for (const auto& message : messages) f.deliver(message);
     check(f.state().connections.at(1).handshakeComplete());
-    check(!f.state().connections.at(1).remoteChokingUs);
+    check(!f.state().connections.at(1).remoteIsChokingUs);
     check(!f.state().connections.at(1).remoteInterestedInUs);
     check(f.state().connections.at(1).remoteBitfield == std::vector<std::uint8_t>({0x01, 0x80}));
 }
@@ -987,7 +1244,7 @@ void handshakeArrivalTiming()
     f.simulation.run();
     check(observations == 3);
     check(f.state().connections.at(1).handshakeComplete());
-    check(!f.state().connections.at(1).remoteChokingUs);
+    check(!f.state().connections.at(1).remoteIsChokingUs);
     check(std::abs(f.simulation.currentTime() - 2.588) < 1e-12);
 }
 } // namespace
@@ -996,6 +1253,15 @@ int main()
 {
     struct Test { const char* name; void (*run)(); };
     const Test tests[] = {
+        {"Choke policy, duplicate suppression and arrival-only updates", chokePolicyAndArrival},
+        {"Choke policy directional, swarm and remote-peer scope", chokePolicyScope},
+        {"CHOKE and UNCHOKE wait in directional FIFO", chokePolicyUsesFifo},
+        {"BITFIELD interest transitions and duplicate suppression", bitfieldInterestTransitions},
+        {"HAVE interest transitions and duplicate suppression", haveInterestTransitions},
+        {"Interest scope by swarm and remote peer", interestScope},
+        {"Interest messages wait in directional FIFO", interestUsesDirectionalFifo},
+        {"Invalid availability preserves interest and sends nothing", invalidAvailabilityPreservesInterest},
+        {"Validated initial local bitfield", initialLocalBitfield},
         {"Exact request/start/completion/arrival event times", exactTransmissionEventTimes},
         {"FIFO start events for a 31-message burst", fifoTransmissionStartEvents},
         {"Simultaneous full-duplex start events", simultaneousTransmissionStartEvents},
