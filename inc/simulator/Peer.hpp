@@ -18,7 +18,12 @@ namespace simulator {
         bool remoteChokingUs = true;
         bool remoteInterestedInUs = false;
         std::vector<std::uint8_t> remoteBitfield;
-        bool handshakeComplete = false;
+        bool handshakeSent = false;
+        bool handshakeReceived = false;
+        // True once the automatic BITFIELD has been scheduled (it may still be queued).
+        bool bitfieldSent = false;
+
+        bool handshakeComplete() const { return handshakeSent && handshakeReceived; }
     };
 
     struct PeerSwarmState {
@@ -45,11 +50,14 @@ namespace simulator {
         // Handshakes require the actual sender identity supplied by Network.
         void receiveMessage(const Swarm& swarm, PeerId sender, const Message& message,
                             const PeerProtocolId* senderProtocolId = nullptr);
+        // Called by Network when a validated transfer begins.
+        void markHandshakeSent(const Swarm& swarm, PeerId receiver);
         bool hasSwarm(SwarmId swarmId) const;
         // Throws std::out_of_range if this SwarmId has not been joined.
         const PeerSwarmState& swarmState(SwarmId swarmId) const;
 
     private:
+        friend class Network;
         std::uint32_t id_;
         PeerProtocolId protocol_id_;
         double upload_capacity_;

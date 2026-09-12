@@ -70,7 +70,7 @@ namespace simulator {
         case MessageType::Have:
         case MessageType::Bitfield: {
             const auto connection = state->second.connections.find(sender);
-            if (connection == state->second.connections.end() || !connection->second.handshakeComplete) {
+            if (connection == state->second.connections.end() || !connection->second.handshakeComplete()) {
                 throw std::invalid_argument("Peer-wire message requires a completed handshake");
             }
             break;
@@ -122,7 +122,7 @@ namespace simulator {
             break;
         }
         case MessageType::Handshake:
-            remote.handshakeComplete = true;
+            remote.handshakeReceived = true;
             break;
         case MessageType::Request:
         case MessageType::Piece:
@@ -130,6 +130,18 @@ namespace simulator {
             // Protocol handling is not implemented yet.
             break;
         }
+    }
+
+    void Peer::markHandshakeSent(const Swarm& swarm, PeerId receiver)
+    {
+        const auto state = swarm_states_.find(swarm.id());
+        if (state == swarm_states_.end()) {
+            throw std::invalid_argument("Sending peer has not joined this swarm");
+        }
+        const auto byteCount = swarm.pieceCount() / 8 + (swarm.pieceCount() % 8 != 0);
+        auto [connection, inserted] = state->second.connections.try_emplace(receiver,
+            PeerConnectionState{true, false, std::vector<std::uint8_t>(byteCount, 0)});
+        connection->second.handshakeSent = true;
     }
 
     bool Peer::hasSwarm(SwarmId swarmId) const

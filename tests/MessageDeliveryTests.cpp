@@ -1,4 +1,5 @@
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -31,6 +32,7 @@ Message handshake(const Swarm& swarm, const PeerProtocolId& id = testSenderProto
 
 void establishHandshake(Peer& receiver, const Swarm& swarm)
 {
+    receiver.markHandshakeSent(swarm, 1);
     receiver.receiveMessage(swarm, 1, handshake(swarm), &testSenderProtocolId);
 }
 
@@ -145,7 +147,10 @@ void checkUnchanged(const PeerSwarmState& actual, const PeerSwarmState& before)
     check(actual.connections.size() == before.connections.size());
     for (const auto& [id, expected] : before.connections) {
         const auto& connection = actual.connections.at(id);
-        check(connection.handshakeComplete == expected.handshakeComplete);
+        check(connection.handshakeSent == expected.handshakeSent);
+        check(connection.handshakeReceived == expected.handshakeReceived);
+        check(connection.bitfieldSent == expected.bitfieldSent);
+        check(connection.handshakeComplete() == expected.handshakeComplete());
         check(connection.remoteChokingUs == expected.remoteChokingUs);
         check(connection.remoteInterestedInUs == expected.remoteInterestedInUs);
         check(connection.remoteBitfield == expected.remoteBitfield);
@@ -322,7 +327,7 @@ struct HandshakeFixture {
     Network network;
 
     HandshakeFixture()
-        : network(simulation, joinedPeers(), {Link(1, 2, 800, 0.1)}, {swarm, other}) {}
+        : network(simulation, joinedPeers(), {Link(1, 2, 800, 0.1), Link(2, 3, 800, 0.1)}, {swarm, other}) {}
     std::vector<Peer> joinedPeers() {
         for (Peer* peer : {&sender, &receiver, &third}) {
             peer->joinSwarm(swarm);
@@ -332,18 +337,393 @@ struct HandshakeFixture {
     }
     void deliver(const Message& message) { network.deliver(1, 1, 2, message); }
     const PeerSwarmState& state() const { return network.peer(2).swarmState(1); }
-    void complete() { deliver(handshake(swarm, sender.protocolId())); }
+    void complete() {
+        network.send(1, 1, 2, handshake(swarm, sender.protocolId()));
+        simulation.run();
+    }
 };
+
+class CheckEvent : public Event {
+public:
+    CheckEvent(double time, std::function<void()> action)
+        : Event(time), action_(std::move(action)) {}
+    void execute() override { action_(); }
+private:
+    std::function<void()> action_;
+};
+
+struct QueueFixture {
+    Swarm swarm{1, InfoHash{0x42}, 8};
+    Peer a{1, 1000, 1000, PeerProtocolId{0xa1}};
+    Peer b{2, 1000, 1000, PeerProtocolId{0xb2}};
+    Simulation simulation;
+    Network network;
+
+    explicit QueueFixture(double latency = 1.0)
+        : network(simulation, joinedPeers(), {Link(1, 2, 800, latency)}, {swarm}) {}
+    std::vector<Peer> joinedPeers() {
+        a.joinSwarm(swarm);
+        b.joinSwarm(swarm);
+        a.markHandshakeSent(swarm, 2);
+        b.markHandshakeSent(swarm, 1);
+        a.receiveMessage(swarm, 2, handshake(swarm, b.protocolId()), &b.protocolId());
+        b.receiveMessage(swarm, 1, handshake(swarm, a.protocolId()), &a.protocolId());
+        return {a, b};
+    }
+    void send(double time, PeerId sender, Message message) {
+        simulation.schedule(std::make_unique<SendMessageEvent>(
+            time, network, 1, sender, sender == 1 ? 2 : 1, std::move(message)));
+    }
+    void observe(double time, std::function<void()> action) {
+        simulation.schedule(std::make_unique<CheckEvent>(time, std::move(action)));
+    }
+    const PeerConnectionState& remote(PeerId receiver = 2) const {
+        return network.peer(receiver).swarmState(1).connections.at(receiver == 1 ? 2 : 1);
+    }
+};
+
+void serializedTransmissionAndLatency()
+{
+    QueueFixture f;
+    check(!f.network.transmissionState(1, 2).active);
+    check(f.network.transmissionState(1, 2).pendingCount == 0);
+    f.send(0, 1, Message(MessageType::Unchoke)); // 5 bytes: 0.05 seconds.
+    f.send(0, 1, Message(MessageType::Have, HavePayload{7})); // 9 bytes: 0.09 seconds.
+    f.observe(0.049, [&] {
+        const auto state = f.network.transmissionState(1, 2);
+        check(state.active && state.pendingCount == 1);
+        check(f.remote().remoteChokingUs);
+    });
+    f.observe(0.051, [&] {
+        const auto state = f.network.transmissionState(1, 2);
+        check(state.active && state.pendingCount == 0); // Second started at 0.05.
+        check(f.remote().remoteChokingUs); // First has not arrived.
+    });
+    f.observe(0.141, [&] {
+        check(!f.network.transmissionState(1, 2).active);
+        check(f.remote().remoteChokingUs);
+        check(f.remote().remoteBitfield[0] == 0);
+    });
+    f.observe(1.049, [&] { check(f.remote().remoteChokingUs); });
+    f.observe(1.051, [&] {
+        check(!f.remote().remoteChokingUs);
+        check(f.remote().remoteBitfield[0] == 0);
+    });
+    f.observe(1.139, [&] { check(f.remote().remoteBitfield[0] == 0); });
+    f.simulation.run();
+    check(f.remote().remoteBitfield[0] == 1);
+    check(std::abs(f.simulation.currentTime() - 1.14) < 1e-12);
+}
+
+void fullDuplexTransmission()
+{
+    QueueFixture f;
+    f.send(0, 1, Message(MessageType::Have, HavePayload{0}));
+    f.send(0, 2, Message(MessageType::Have, HavePayload{7}));
+    f.observe(0.04, [&] {
+        check(f.network.transmissionState(1, 2).active);
+        check(f.network.transmissionState(2, 1).active);
+    });
+    f.observe(0.091, [&] {
+        check(!f.network.transmissionState(1, 2).active);
+        check(!f.network.transmissionState(2, 1).active);
+        check(f.remote(1).remoteBitfield[0] == 0);
+        check(f.remote(2).remoteBitfield[0] == 0);
+    });
+    f.simulation.run();
+    check(f.remote(1).remoteBitfield[0] == 1);
+    check(f.remote(2).remoteBitfield[0] == 0x80);
+    check(std::abs(f.simulation.currentTime() - 1.09) < 1e-12);
+}
+
+void fifoBurst()
+{
+    QueueFixture f;
+    // One active message followed by thirty messages queued in the B -> A direction.
+    for (unsigned i = 0; i < 31; ++i) {
+        f.send(i == 0 ? 0 : 0.01, 2, Message(MessageType::Bitfield,
+            BitfieldPayload{{static_cast<std::uint8_t>(i + 1)}}));
+        f.observe(1.0 + (i + 1) * 0.06 + 0.001, [&, i] {
+            check(f.remote(1).remoteBitfield[0] == i + 1);
+        });
+    }
+    f.observe(0.02, [&] {
+        const auto state = f.network.transmissionState(2, 1);
+        check(state.active && state.pendingCount == 30);
+        check(!f.network.transmissionState(1, 2).active);
+    });
+    f.observe(0.061, [&] {
+        const auto state = f.network.transmissionState(2, 1);
+        check(state.active && state.pendingCount == 29);
+    });
+    f.simulation.run();
+    const auto state = f.network.transmissionState(2, 1);
+    check(!state.active && state.pendingCount == 0);
+    check(f.remote(1).remoteBitfield[0] == 31);
+}
+
+void enqueueAtCompletion()
+{
+    QueueFixture f(0);
+    for (unsigned i = 0; i < 3; ++i) {
+        // Third send executes at the first completion's timestamp.
+        f.send(i == 2 ? 0.06 : 0, 1, Message(MessageType::Bitfield,
+            BitfieldPayload{{static_cast<std::uint8_t>(i + 1)}}));
+    }
+    f.observe(0.061, [&] { check(f.remote().remoteBitfield[0] == 1); });
+    f.observe(0.121, [&] { check(f.remote().remoteBitfield[0] == 2); });
+    f.simulation.run();
+    check(f.remote().remoteBitfield[0] == 3);
+    check(!f.network.transmissionState(1, 2).active);
+    check(f.network.transmissionState(1, 2).pendingCount == 0);
+    check(std::abs(f.simulation.currentTime() - 0.18) < 1e-12);
+}
+
+void queuedHandshakeResponse()
+{
+    HandshakeFixture f;
+    // Existing PIECE size/no-op behavior provides a two-second reverse transmission.
+    f.network.send(1, 2, 1, Message(MessageType::Piece, PiecePayload{0, 0, 112}));
+    f.network.send(1, 1, 2, handshake(f.swarm));
+    f.simulation.schedule(std::make_unique<CheckEvent>(1.189, [&] {
+        const auto& b = f.state().connections.at(1);
+        check(b.handshakeReceived && !b.handshakeSent && !b.handshakeComplete());
+        check(f.network.transmissionState(2, 1).pendingCount == 1);
+        f.deliver(handshake(f.swarm));
+        f.deliver(handshake(f.swarm));
+        check(f.network.transmissionState(2, 1).pendingCount == 1);
+        const auto before = f.state();
+        rejects([&] { f.deliver(Message(MessageType::Unchoke)); });
+        checkUnchanged(f.state(), before);
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(2.001, [&] {
+        check(f.state().connections.at(1).handshakeSent);
+        check(f.state().connections.at(1).bitfieldSent);
+        check(f.network.transmissionState(2, 1).pendingCount == 1); // Automatic BITFIELD.
+        check(f.network.transmissionState(2, 1).active);
+    }));
+    f.simulation.run();
+    check(f.state().connections.at(1).handshakeComplete());
+    check(f.network.peer(1).swarmState(1).connections.at(2).handshakeComplete());
+    check(!f.network.transmissionState(2, 1).active);
+    check(std::abs(f.simulation.currentTime() - 3.4) < 1e-12);
+}
+struct AutoBitfieldFixture {
+    Swarm swarm{1, InfoHash{0x13}, 9};
+    Swarm other{2, InfoHash{0x24}, 8};
+    Peer a{1, 1000, 1000, PeerProtocolId{0xa1}};
+    Peer b{2, 500, 500, PeerProtocolId{0xb2}};
+    Peer c{3, 1000, 1000, PeerProtocolId{0xc3}};
+    Simulation simulation;
+    Network network;
+
+    AutoBitfieldFixture()
+        : network(simulation, joinedPeers(),
+            {Link(1, 2, 800, 0.1), Link(2, 3, 800, 0.1)}, {swarm, other}) {}
+    std::vector<Peer> joinedPeers() {
+        for (Peer* peer : {&a, &b, &c}) {
+            peer->joinSwarm(swarm);
+            peer->joinSwarm(other);
+            // Fixture-only initialization on mutable Peers, before Network copies them.
+            // No production piece-management API is needed for this feature.
+            const_cast<PeerSwarmState&>(peer->swarmState(1)).localBitfield =
+                {static_cast<std::uint8_t>(peer->id()), 0x80};
+            const_cast<PeerSwarmState&>(peer->swarmState(2)).localBitfield =
+                {static_cast<std::uint8_t>(0x80u >> peer->id())};
+        }
+        return {a, b, c};
+    }
+    void initiate(const Swarm& current, PeerId sender = 1, PeerId receiver = 2) {
+        simulation.schedule(std::make_unique<SendMessageEvent>(
+            simulation.currentTime(), network, current.id(), sender, receiver,
+            handshake(current, network.peer(sender).protocolId())));
+    }
+    void checkExchange(SwarmId swarmId, PeerId first = 1, PeerId second = 2) const {
+        const auto& firstState = network.peer(first).swarmState(swarmId);
+        const auto& secondState = network.peer(second).swarmState(swarmId);
+        const auto& forward = firstState.connections.at(second);
+        const auto& reverse = secondState.connections.at(first);
+        check(forward.handshakeComplete() && reverse.handshakeComplete());
+        check(forward.bitfieldSent && reverse.bitfieldSent);
+        check(forward.remoteBitfield == secondState.localBitfield);
+        check(reverse.remoteBitfield == firstState.localBitfield);
+    }
+};
+
+void automaticBitfieldExchange()
+{
+    AutoBitfieldFixture f;
+    check(!PeerConnectionState{}.bitfieldSent);
+    f.initiate(f.swarm);
+    f.simulation.schedule(std::make_unique<CheckEvent>(0.001, [&] {
+        check(!f.network.peer(1).swarmState(1).connections.at(2).bitfieldSent);
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(1.189, [&] {
+        check(f.network.peer(2).swarmState(1).connections.at(1).bitfieldSent);
+        check(!f.network.peer(1).swarmState(1).connections.at(2).bitfieldSent);
+        check(f.network.transmissionState(2, 1).pendingCount == 1);
+        // Duplicate handshakes while B's BITFIELD waits behind its response.
+        f.network.deliver(1, 1, 2, handshake(f.swarm, f.a.protocolId()));
+        f.network.deliver(1, 1, 2, handshake(f.swarm, f.a.protocolId()));
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(1.190, [&] {
+        check(f.network.transmissionState(2, 1).pendingCount == 1);
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(2.377, [&] {
+        const auto& a = f.network.peer(1).swarmState(1).connections.at(2);
+        check(a.handshakeComplete() && a.bitfieldSent);
+        check(a.remoteBitfield == std::vector<std::uint8_t>({0, 0}));
+        f.network.deliver(1, 2, 1, handshake(f.swarm, f.b.protocolId()));
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(2.487, [&] {
+        check(f.network.peer(1).swarmState(1).connections.at(2).remoteBitfield
+            == std::vector<std::uint8_t>({0, 0}));
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(2.489, [&] {
+        check(f.network.peer(1).swarmState(1).connections.at(2).remoteBitfield
+            == f.b.swarmState(1).localBitfield);
+        check(f.network.peer(2).swarmState(1).connections.at(1).remoteBitfield
+            == std::vector<std::uint8_t>({0, 0}));
+    }));
+    f.simulation.run();
+    f.checkExchange(1);
+    // Exactly one 7-byte BITFIELD per direction: B arrives at 2.488, A at 2.588.
+    check(std::abs(f.simulation.currentTime() - 2.588) < 1e-12);
+
+    const auto aBefore = f.network.peer(1).swarmState(1);
+    const auto bBefore = f.network.peer(2).swarmState(1);
+    const double finished = f.simulation.currentTime();
+    f.network.deliver(1, 1, 2, handshake(f.swarm, f.a.protocolId()));
+    f.network.deliver(1, 2, 1, handshake(f.swarm, f.b.protocolId()));
+    f.simulation.run();
+    check(f.simulation.currentTime() == finished);
+    checkUnchanged(f.network.peer(1).swarmState(1), aBefore);
+    checkUnchanged(f.network.peer(2).swarmState(1), bBefore);
+}
+
+void automaticBitfieldScope()
+{
+    AutoBitfieldFixture f;
+    // Default connections for the second swarm and another remote peer.
+    f.network.deliver(2, 1, 2, Message(MessageType::Request, RequestPayload{}));
+    f.network.deliver(1, 3, 2, Message(MessageType::Request, RequestPayload{}));
+    f.initiate(f.swarm);
+    f.simulation.run();
+    f.checkExchange(1);
+    check(!f.network.peer(2).swarmState(2).connections.at(1).bitfieldSent);
+    check(!f.network.peer(2).swarmState(1).connections.at(3).bitfieldSent);
+    const auto firstBefore = f.network.peer(2).swarmState(1);
+    f.initiate(f.other);
+    f.simulation.run();
+    f.checkExchange(2);
+    checkUnchanged(f.network.peer(2).swarmState(1), firstBefore);
+    f.initiate(f.swarm, 3, 2);
+    f.simulation.run();
+    f.checkExchange(1, 3, 2);
+    f.checkExchange(1);
+    f.checkExchange(2);
+}
+
+void bitfieldDoesNotTriggerResponse()
+{
+    QueueFixture f; // Handshake flags set directly; no network completion event occurred.
+    check(!f.remote().bitfieldSent);
+    f.network.deliver(1, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0x80}}));
+    f.simulation.run();
+    check(!f.remote().bitfieldSent);
+    check(f.remote().remoteBitfield[0] == 0x80);
+    check(f.simulation.currentTime() == 0);
+    check(!f.network.transmissionState(2, 1).active);
+    check(f.network.transmissionState(2, 1).pendingCount == 0);
+}
+
+void simultaneousHandshakeBitfields()
+{
+    AutoBitfieldFixture f;
+    f.initiate(f.swarm);
+    f.initiate(f.swarm, 2, 1);
+    f.simulation.run();
+    f.checkExchange(1);
+    check(std::abs(f.simulation.currentTime() - 1.4) < 1e-12);
+}
+void twoWayHandshakeLifecycle()
+{
+    HandshakeFixture f;
+    const PeerConnectionState initial;
+    check(!initial.handshakeSent && !initial.handshakeReceived && !initial.handshakeComplete());
+    const std::vector<Message> ordinary{
+        Message(MessageType::Choke), Message(MessageType::Unchoke),
+        Message(MessageType::Interested), Message(MessageType::NotInterested),
+        Message(MessageType::Have, HavePayload{8}),
+        Message(MessageType::Bitfield, BitfieldPayload{{0x01, 0x80}})
+    };
+
+    // A received a valid handshake but has not sent one: every ordinary type rejects.
+    Peer receivedOnly = f.receiver;
+    receivedOnly.receiveMessage(f.swarm, 1, handshake(f.swarm), &testSenderProtocolId);
+    const auto receivedBefore = receivedOnly.swarmState(1);
+    check(receivedBefore.connections.at(1).handshakeReceived);
+    check(!receivedBefore.connections.at(1).handshakeSent);
+    check(!receivedBefore.connections.at(1).handshakeComplete());
+    for (const auto& message : ordinary) {
+        rejects([&] { receivedOnly.receiveMessage(f.swarm, 1, message); });
+        checkUnchanged(receivedOnly.swarmState(1), receivedBefore);
+    }
+
+    f.simulation.schedule(std::make_unique<SendMessageEvent>(
+        0.0, f.network, 1, 1, 2, handshake(f.swarm)));
+    check(f.network.peer(1).swarmState(1).connections.empty());
+    f.simulation.schedule(std::make_unique<CheckEvent>(0.0, [&] {
+        const auto before = f.network.peer(1).swarmState(1);
+        const auto& a = before.connections.at(2);
+        check(a.handshakeSent && !a.handshakeReceived && !a.handshakeComplete());
+        check(f.state().connections.empty());
+        for (const auto& message : ordinary) {
+            rejects([&] { f.network.deliver(1, 2, 1, message); });
+            checkUnchanged(f.network.peer(1).swarmState(1), before);
+        }
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(1.189, [&] {
+        const auto& b = f.state().connections.at(1);
+        check(b.handshakeReceived && b.handshakeSent && b.handshakeComplete());
+        check(!f.network.peer(1).swarmState(1).connections.at(2).handshakeReceived);
+        const auto before = f.state();
+        // Two duplicate arrivals must not schedule additional responses.
+        f.deliver(handshake(f.swarm));
+        f.deliver(handshake(f.swarm));
+        checkUnchanged(f.state(), before);
+    }));
+    f.simulation.run();
+    check(f.network.peer(1).swarmState(1).connections.at(2).handshakeComplete());
+    check(f.state().connections.at(1).handshakeComplete());
+    // Handshake response arrives at 2.376; A's BITFIELD arrives 0.212 later.
+    check(std::abs(f.simulation.currentTime() - 2.588) < 1e-12);
+    for (const auto& message : ordinary) {
+        f.network.deliver(1, 1, 2, message);
+        f.network.deliver(1, 2, 1, message);
+    }
+    const double finished = f.simulation.currentTime();
+    f.deliver(handshake(f.swarm));
+    f.simulation.run();
+    check(f.simulation.currentTime() == finished);
+}
+
+void failedHandshakeSend()
+{
+    HandshakeFixture f;
+    rejects([&] { f.network.send(1, 1, 3, handshake(f.swarm)); });
+    check(f.network.peer(1).swarmState(1).connections.empty());
+}
 
 void validHandshake()
 {
     HandshakeFixture f;
-    check(!PeerConnectionState{}.handshakeComplete);
+    check(!PeerConnectionState{}.handshakeComplete());
     check(f.sender.id() == 1 && f.sender.protocolId() == testSenderProtocolId);
     check(f.state().connections.empty());
     f.complete();
     const auto& remote = f.state().connections.at(1);
-    check(remote.handshakeComplete);
+    check(remote.handshakeComplete());
     check(remote.remoteChokingUs && !remote.remoteInterestedInUs);
     check(remote.remoteBitfield == std::vector<std::uint8_t>({0, 0}));
     f.deliver(Message(MessageType::Unchoke));
@@ -374,14 +754,14 @@ void invalidHandshake(bool wrongHash)
     // The existing REQUEST no-op creates a default connection, allowing us
     // to check an existing incomplete connection without adding protocol behavior.
     f.deliver(Message(MessageType::Request, RequestPayload{}));
-    check(!f.state().connections.at(1).handshakeComplete);
+    check(!f.state().connections.at(1).handshakeComplete());
     auto payload = HandshakePayload{f.swarm.infoHash(), f.sender.protocolId()};
     if (wrongHash) payload.infoHash.back() ^= 1;
     else payload.peerId.back() ^= 1;
     const auto before = f.state();
     rejects([&] { f.deliver(Message(MessageType::Handshake, payload)); });
     checkUnchanged(f.state(), before);
-    check(!f.state().connections.at(1).handshakeComplete);
+    check(!f.state().connections.at(1).handshakeComplete());
     f.complete();
     const auto completeBefore = f.state();
     rejects([&] { f.deliver(Message(MessageType::Handshake, payload)); });
@@ -407,7 +787,7 @@ void ordinaryMessagesRequireHandshake()
     }
     f.complete();
     for (const auto& message : messages) f.deliver(message);
-    check(f.state().connections.at(1).handshakeComplete);
+    check(f.state().connections.at(1).handshakeComplete());
     check(!f.state().connections.at(1).remoteChokingUs);
     check(!f.state().connections.at(1).remoteInterestedInUs);
     check(f.state().connections.at(1).remoteBitfield == std::vector<std::uint8_t>({0x01, 0x80}));
@@ -420,10 +800,10 @@ void handshakeScope()
     const auto before = f.state();
     rejects([&] { f.network.deliver(1, 3, 2, Message(MessageType::Unchoke)); });
     rejects([&] { f.network.deliver(2, 1, 2, Message(MessageType::Unchoke)); });
-    rejects([&] { f.network.deliver(1, 2, 1, Message(MessageType::Unchoke)); });
+    f.network.deliver(1, 2, 1, Message(MessageType::Unchoke));
     checkUnchanged(f.state(), before);
     check(f.network.peer(2).swarmState(2).connections.empty());
-    check(f.network.peer(1).swarmState(1).connections.empty());
+    check(f.network.peer(1).swarmState(1).connections.at(2).handshakeComplete());
 }
 
 void handshakeUnjoinedSwarm()
@@ -454,7 +834,7 @@ public:
         : Event(time), network_(network), expected_(expected), observations_(observations) {}
     void execute() override {
         const auto& connections = network_.peer(2).swarmState(1).connections;
-        if (expected_) check(connections.at(1).handshakeComplete);
+        if (expected_) check(connections.at(1).handshakeComplete());
         else check(connections.empty());
         ++observations_;
     }
@@ -480,9 +860,9 @@ void handshakeArrivalTiming()
     check(f.state().connections.empty());
     f.simulation.run();
     check(observations == 3);
-    check(f.state().connections.at(1).handshakeComplete);
+    check(f.state().connections.at(1).handshakeComplete());
     check(!f.state().connections.at(1).remoteChokingUs);
-    check(std::abs(f.simulation.currentTime() - 2.18) < 1e-12);
+    check(std::abs(f.simulation.currentTime() - 2.588) < 1e-12);
 }
 } // namespace
 
@@ -490,6 +870,17 @@ int main()
 {
     struct Test { const char* name; void (*run)(); };
     const Test tests[] = {
+        {"Automatic BITFIELD exchange, FIFO timing and duplicates", automaticBitfieldExchange},
+        {"Automatic BITFIELD scope by swarm and remote peer", automaticBitfieldScope},
+        {"Receiving BITFIELD never triggers a response", bitfieldDoesNotTriggerResponse},
+        {"Simultaneous handshakes exchange BITFIELDs once", simultaneousHandshakeBitfields},
+        {"Same-direction serialization and propagation latency", serializedTransmissionAndLatency},
+        {"Full-duplex simultaneous transmission", fullDuplexTransmission},
+        {"FIFO burst of 31 reverse-direction messages", fifoBurst},
+        {"Enqueue at completion with zero latency", enqueueAtCompletion},
+        {"Queued handshake response starts once", queuedHandshakeResponse},
+        {"Two-way handshake lifecycle and duplicate responses", twoWayHandshakeLifecycle},
+        {"Failed handshake send leaves state unchanged", failedHandshakeSend},
         {"Valid handshake and subsequent UNCHOKE", validHandshake},
         {"Wrong handshake infoHash", [] { invalidHandshake(true); }},
         {"Wrong handshake PeerProtocolId", [] { invalidHandshake(false); }},

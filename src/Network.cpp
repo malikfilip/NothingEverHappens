@@ -7,7 +7,9 @@
 #include <utility>
 
 #include "simulator/MessageArrivalEvent.hpp"
+#include "simulator/SendMessageEvent.hpp"
 #include "simulator/Simulation.hpp"
+#include "simulator/TransmissionCompleteEvent.hpp"
 
 namespace simulator {
 
@@ -47,19 +49,41 @@ namespace simulator {
         if (message.type() == MessageType::Handshake) {
             senderProtocolId = &peer(sender).protocolId();
         }
-        to->receiveMessage(swarm(swarmId), sender, message, senderProtocolId);
+        const auto& currentSwarm = swarm(swarmId);
+        to->receiveMessage(currentSwarm, sender, message, senderProtocolId);
+        if (message.type() == MessageType::Handshake
+            && !to->swarmState(swarmId).connections.at(sender).handshakeSent) {
+            const auto& link = links_[linkIndex(receiver, sender)];
+            const auto& direction = receiver == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
+            const bool queued = std::any_of(direction.pending.begin(), direction.pending.end(),
+                [swarmId](const QueuedTransmission& transmission) {
+                    return transmission.swarmId == swarmId
+                        && transmission.message.type() == MessageType::Handshake;
+                });
+            if (!queued) {
+                send(swarmId, receiver, sender, Message(MessageType::Handshake,
+                    HandshakePayload{currentSwarm.infoHash(), to->protocolId()}));
+            }
+        }
+        if (message.type() == MessageType::Handshake) {
+            sendInitialBitfield(*to, swarmId, sender);
+        }
     }
 
-    void Network::send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
+    void Network::sendInitialBitfield(Peer& sender, SwarmId swarmId, PeerId receiver)
     {
-        const auto from = std::find_if(peers_.begin(), peers_.end(),
-            [sender](const Peer& peer) { return peer.id() == sender; });
-        const auto to = std::find_if(peers_.begin(), peers_.end(),
-            [receiver](const Peer& peer) { return peer.id() == receiver; });
-        if (from == peers_.end() || to == peers_.end()) {
-            throw std::invalid_argument("Unknown sender or receiver");
-        }
+        auto& state = sender.swarm_states_.at(swarmId);
+        auto& connection = state.connections.at(receiver);
+        if (!connection.handshakeComplete() || connection.bitfieldSent) return;
 
+        simulation_.schedule(std::make_unique<SendMessageEvent>(
+            simulation_.currentTime(), *this, swarmId, sender.id(), receiver,
+            Message(MessageType::Bitfield, BitfieldPayload{state.localBitfield})));
+        connection.bitfieldSent = true;
+    }
+
+    std::size_t Network::linkIndex(PeerId sender, PeerId receiver) const
+    {
         const auto link = std::find_if(links_.begin(), links_.end(),
             [sender, receiver](const Link& candidate) {
                 return (candidate.endpointA() == sender && candidate.endpointB() == receiver)
@@ -68,26 +92,85 @@ namespace simulator {
         if (link == links_.end()) {
             throw std::invalid_argument("No link connects sender and receiver");
         }
+        return static_cast<std::size_t>(link - links_.begin());
+    }
 
-        for (double bandwidth : {from->uploadCapacity(), to->downloadCapacity(), link->bandwidth()}) {
+    Network::TransmissionState Network::transmissionState(PeerId sender, PeerId receiver) const
+    {
+        const auto& link = links_[linkIndex(sender, receiver)];
+        const auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
+        return {direction.active, direction.pending.size()};
+    }
+
+    void Network::send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
+    {
+        const auto& from = peer(sender);
+        peer(receiver);
+        const auto index = linkIndex(sender, receiver);
+        if (message.type() == MessageType::Handshake) {
+            swarm(swarmId);
+            if (!from.hasSwarm(swarmId)) {
+                throw std::invalid_argument("Sending peer has not joined this swarm");
+            }
+        }
+        auto& link = links_[index];
+        auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
+        direction.pending.push_back({swarmId, sender, receiver, std::move(message)});
+        if (!direction.active) {
+            startTransmission(index, sender);
+        }
+    }
+
+    void Network::startTransmission(std::size_t index, PeerId sender)
+    {
+        auto& link = links_[index];
+        auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
+        if (direction.active || direction.pending.empty()) return;
+
+        // Only the front message is considered. No timing is assigned while queued.
+        auto transmission = std::move(direction.pending.front());
+        direction.pending.pop_front();
+        const auto& to = peer(transmission.receiver);
+        const auto from = std::find_if(peers_.begin(), peers_.end(),
+            [sender](const Peer& candidate) { return candidate.id() == sender; });
+        for (double bandwidth : {from->uploadCapacity(), to.downloadCapacity(), link.bandwidth()}) {
             if (!std::isfinite(bandwidth) || bandwidth <= 0.0) {
                 throw std::invalid_argument("Transfer bandwidth must be finite and positive");
             }
         }
-        if (!std::isfinite(link->latency()) || link->latency() < 0.0) {
+        if (!std::isfinite(link.latency()) || link.latency() < 0.0) {
             throw std::invalid_argument("Link latency must be finite and nonnegative");
         }
-
         const double effectiveBandwidth = std::min({
-            from->uploadCapacity(), to->downloadCapacity(), link->bandwidth()});
-        const double transmissionTime = static_cast<double>(message.wireSize()) * 8.0
+            from->uploadCapacity(), to.downloadCapacity(), link.bandwidth()});
+        const double transmissionTime = static_cast<double>(transmission.message.wireSize()) * 8.0
                                       / effectiveBandwidth;
-        const double arrivalTime = simulation_.currentTime() + link->latency() + transmissionTime;
-        if (!std::isfinite(arrivalTime)) {
-            throw std::invalid_argument("Arrival time must be finite");
+        const double completionTime = simulation_.currentTime() + transmissionTime;
+        const double arrivalTime = completionTime + link.latency();
+        if (!std::isfinite(completionTime) || !std::isfinite(arrivalTime)) {
+            throw std::invalid_argument("Transmission completion and arrival times must be finite");
         }
+        const bool isHandshake = transmission.message.type() == MessageType::Handshake;
+        if (isHandshake) {
+            from->markHandshakeSent(swarm(transmission.swarmId), transmission.receiver);
+        }
+        direction.active = true;
+        simulation_.schedule(std::make_unique<TransmissionCompleteEvent>(
+            completionTime, *this, index, sender));
         simulation_.schedule(std::make_unique<MessageArrivalEvent>(
-            arrivalTime, *this, swarmId, sender, receiver, std::move(message)));
+            arrivalTime, *this, transmission.swarmId, transmission.sender,
+            transmission.receiver, std::move(transmission.message)));
+        if (isHandshake) {
+            sendInitialBitfield(*from, transmission.swarmId, transmission.receiver);
+        }
+    }
+
+    void Network::completeTransmission(std::size_t index, PeerId sender)
+    {
+        auto& link = links_[index];
+        auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
+        direction.active = false;
+        startTransmission(index, sender);
     }
 
 } // namespace simulator

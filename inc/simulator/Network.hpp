@@ -10,13 +10,14 @@
 namespace simulator {
 
     class Simulation;
+    class TransmissionCompleteEvent;
 
     class Network {
     public:
         // Simulation must outlive this network, which owns its peers, links, and swarms.
         Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms = {});
 
-        // Schedules arrival; throws std::invalid_argument for missing endpoints,
+        // Enqueues transmission, starting immediately if idle; throws std::invalid_argument for missing endpoints,
         // a missing link, or invalid transfer bandwidth/latency.
         void send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message);
 
@@ -27,7 +28,20 @@ namespace simulator {
         const Peer& peer(PeerId id) const;
         const Swarm& swarm(SwarmId id) const;
 
+        struct TransmissionState {
+            bool active;
+            std::size_t pendingCount; // Excludes the active transmission.
+        };
+        // Read-only snapshot; throws std::invalid_argument for a missing link.
+        TransmissionState transmissionState(PeerId sender, PeerId receiver) const;
+
     private:
+        friend class TransmissionCompleteEvent;
+        void sendInitialBitfield(Peer& sender, SwarmId swarmId, PeerId receiver);
+        std::size_t linkIndex(PeerId sender, PeerId receiver) const;
+        void startTransmission(std::size_t linkIndex, PeerId sender);
+        void completeTransmission(std::size_t linkIndex, PeerId sender);
+
         Simulation& simulation_;
         std::vector<Peer> peers_;
         std::vector<Link> links_;
