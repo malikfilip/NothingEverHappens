@@ -7,7 +7,7 @@
 
 int main()
 {
-    const simulator::Swarm swarm(1, simulator::InfoHash{1}, 9);
+    const simulator::Swarm swarm(1, simulator::InfoHash{1}, 8 * 16384 + 4096, 16384);
     simulator::Peer sender(1, 1000.0, 2000.0, simulator::PeerProtocolId{0xa1});
     simulator::Peer receiver(2, 2000.0, 500.0, simulator::PeerProtocolId{0xb2});
     sender.joinSwarm(swarm, {0x80, 0}); // Peer 1 initially owns piece 0.
@@ -20,6 +20,12 @@ int main()
         0.0, network, swarm.id(), 1, 2,
         simulator::Message(simulator::MessageType::Handshake,
             simulator::HandshakePayload{swarm.infoHash(), sender.protocolId()})));
+    simulation.run();
+
+    // One explicit request after UNCHOKE; no automatic block scheduling.
+    simulation.schedule(std::make_unique<simulator::SendMessageEvent>(
+        simulation.currentTime(), network, swarm.id(), 2, 1,
+        simulator::Message(simulator::MessageType::Request, simulator::RequestPayload{0, 0, 1024})));
     simulation.run();
 
     const auto& a = network.peer(1).swarmState(swarm.id());
@@ -43,6 +49,7 @@ int main()
               << "Peer 1 received peer 2 interest: " << aToB.remoteInterestedInUs << '\n';
     std::cout << "Peer 1 is choking peer 2: " << aToB.weAreChokingRemote << '\n'
               << "Peer 2 sees peer 1 choking it: " << bToA.remoteIsChokingUs << '\n';
-    return complete && exchanged && bToA.weAreInterestedInRemote && aToB.remoteInterestedInUs
+    std::cout << "Peer 1 accepted requests from peer 2: " << aToB.acceptedRequests.size() << '\n';
+    return aToB.acceptedRequests.size() == 1 && complete && exchanged && bToA.weAreInterestedInRemote && aToB.remoteInterestedInUs
         && !aToB.weAreChokingRemote && !bToA.remoteIsChokingUs ? 0 : 1;
 }

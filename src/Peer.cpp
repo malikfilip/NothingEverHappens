@@ -1,6 +1,7 @@
 #include "simulator/Peer.hpp"
 
 #include <stdexcept>
+#include <algorithm>
 #include <utility>
 
 #include "simulator/Swarm.hpp"
@@ -66,7 +67,29 @@ namespace simulator {
         }
         return false;
     }
-    void Peer::receiveMessage(const Swarm& swarm, PeerId sender, const Message& message, const PeerProtocolId* senderProtocolId)
+    void Peer::validateRequestTo(const Swarm& swarm, const Peer& remote, const RequestPayload& request) const
+    {
+        if (!hasSwarm(swarm.id()) || !remote.hasSwarm(swarm.id())) {
+            throw std::invalid_argument("REQUEST peers must share the swarm");
+        }
+        const auto& state = swarmState(swarm.id());
+        const auto connection = state.connections.find(remote.id());
+        if (connection == state.connections.end() || !connection->second.handshakeComplete()
+            || !connection->second.weAreInterestedInRemote || connection->second.remoteIsChokingUs) {
+            throw std::invalid_argument("REQUEST requires handshake, interest and an unchoked connection");
+        }
+        const auto size = swarm.pieceSize(request.index);
+        if (request.length == 0 || request.begin >= size || request.length > size - request.begin) {
+            throw std::invalid_argument("REQUEST block is outside the piece");
+        }
+        const auto mask = 0x80u >> (request.index % 8);
+        if ((state.localBitfield[request.index / 8] & mask) != 0
+            || (remote.swarmState(swarm.id()).localBitfield[request.index / 8] & mask) == 0) {
+            throw std::invalid_argument("REQUEST requires a missing local piece owned by the remote peer");
+        }
+    }
+
+    void Peer::receiveMessage(const Swarm& swarm, PeerId sender, const Message& message, const PeerProtocolId* senderProtocolId, const Peer* senderPeer)
     {
         const auto state = swarm_states_.find(swarm.id());
         if (state == swarm_states_.end()) {
@@ -117,6 +140,18 @@ namespace simulator {
             }
         }
 
+        if (message.type() == MessageType::Request) {
+            if (!senderPeer || senderPeer->id() != sender) {
+                throw std::invalid_argument("REQUEST requires actual sender context");
+            }
+            senderPeer->validateRequestTo(swarm, *this, std::get<RequestPayload>(message.payload()));
+            const auto connection = state->second.connections.find(sender);
+            if (connection == state->second.connections.end() || !connection->second.handshakeComplete()
+                || !connection->second.remoteInterestedInUs || connection->second.weAreChokingRemote) {
+                throw std::invalid_argument("REQUEST sender must be interested and unchoked by us");
+            }
+        }
+
         auto& connections = state->second.connections;
         auto connection = connections.find(sender);
         if (connection == connections.end()) {
@@ -150,7 +185,14 @@ namespace simulator {
         case MessageType::Handshake:
             remote.handshakeReceived = true;
             break;
-        case MessageType::Request:
+        case MessageType::Request: {
+            const auto& request = std::get<RequestPayload>(message.payload());
+            if (std::find(remote.acceptedRequests.begin(), remote.acceptedRequests.end(), request)
+                == remote.acceptedRequests.end()) {
+                remote.acceptedRequests.push_back(request);
+            }
+            break;
+        }
         case MessageType::Piece:
         case MessageType::Cancel:
             // Protocol handling is not implemented yet.

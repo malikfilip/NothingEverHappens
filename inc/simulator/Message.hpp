@@ -42,6 +42,7 @@ namespace simulator {
         std::uint32_t index{};
         std::uint32_t begin{};
         std::uint32_t length{};
+        bool operator==(const RequestPayload&) const = default;
     };
 
     struct PiecePayload {

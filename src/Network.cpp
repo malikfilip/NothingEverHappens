@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -64,7 +65,8 @@ namespace simulator {
                 wasChoking = connection->second.weAreChokingRemote;
             }
         }
-        to->receiveMessage(currentSwarm, sender, message, senderProtocolId);
+        to->receiveMessage(currentSwarm, sender, message, senderProtocolId,
+            message.type() == MessageType::Request ? &peer(sender) : nullptr);
         if (interestMessage) {
             const bool choking = to->swarmState(swarmId).connections.at(sender).weAreChokingRemote;
             if (choking != wasChoking) {
@@ -137,7 +139,7 @@ namespace simulator {
     void Network::send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
     {
         const auto& from = peer(sender);
-        peer(receiver);
+        const auto& to = peer(receiver);
         const auto index = linkIndex(sender, receiver);
         if (message.type() == MessageType::Handshake) {
             swarm(swarmId);
@@ -145,11 +147,24 @@ namespace simulator {
                 throw std::invalid_argument("Sending peer has not joined this swarm");
             }
         }
+        if (message.type() == MessageType::Request) {
+            const auto& request = std::get<RequestPayload>(message.payload());
+            from.validateRequestTo(swarm(swarmId), to, request);
+            const auto& pending = from.swarmState(swarmId).connections.at(receiver).outgoingRequests;
+            if (std::find(pending.begin(), pending.end(), request) != pending.end()) return;
+        }
+        const auto request = message.type() == MessageType::Request
+            ? std::optional<RequestPayload>(std::get<RequestPayload>(message.payload())) : std::nullopt;
         auto& link = links_[index];
         auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
         direction.pending.push_back({swarmId, sender, receiver, std::move(message)});
         if (!direction.active) {
             startTransmission(index, sender);
+        }
+        if (request) {
+            const auto mutableFrom = std::find_if(peers_.begin(), peers_.end(),
+                [sender](const Peer& candidate) { return candidate.id() == sender; });
+            mutableFrom->swarm_states_.at(swarmId).connections.at(receiver).outgoingRequests.push_back(*request);
         }
     }
 
