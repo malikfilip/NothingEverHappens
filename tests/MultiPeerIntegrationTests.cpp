@@ -5,6 +5,7 @@
 #include <deque>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -68,6 +69,15 @@ void autonomousFourPeerRing(bool tracing)
     bool independentLinks = false, fullDuplex = false;
 
     simulation.setEventObserver([&](const Event& event) {
+        std::array<double, 5> outgoing{}, incoming{};
+        for (const auto& [id, active] : network.activeTransmissions()) {
+            outgoing[active.sender] += active.currentRate;
+            incoming[active.receiver] += active.currentRate;
+        }
+        for (PeerId id = 1; id <= 4; ++id) {
+            require(outgoing[id] <= bandwidth + 1e-8 && incoming[id] <= bandwidth + 1e-8,
+                "Aggregate active bandwidth exceeded peer capacity");
+        }
         // Inspect actual reservations at every event boundary, not just transmitted requests.
         for (PeerId id = 1; id <= 4; ++id) {
             const auto& state = network.peer(id).swarmState(1);
@@ -112,7 +122,7 @@ void autonomousFourPeerRing(bool tracing)
             require(sameTime(event.time(), std::max(queued.time, direction.lastCompletion)),
                 "Another link or propagation latency delayed transmission start");
             const auto& message = start->message();
-            const double completion = event.time() + message.wireSize() * 8.0 / bandwidth;
+            const double completion = std::numeric_limits<double>::infinity(); // Rate can change while active.
             if (message.type() == MessageType::Request) {
                 const auto block = std::get<RequestPayload>(message.payload());
                 require(block.length > 0 && block.length <= 16384 && block.begin + block.length <= swarm.pieceSize(block.index),
@@ -151,14 +161,22 @@ void autonomousFourPeerRing(bool tracing)
                 }
             }
             direction.active = Transfer{message, completion, completion + latency};
-            direction.arrivals.push_back(*direction.active);
+
             ++direction.starts;
         } else if (const auto* complete = dynamic_cast<const TransmissionCompleteEvent*>(&event)) {
+            const auto active = network.activeTransmissions().find(complete->transmissionId());
+            if (active == network.activeTransmissions().end()
+                || active->second.generation != complete->generation()) return;
+            const auto& transmission = active->second;
+            require(sameTime(event.time(), transmission.lastRateUpdateTime
+                + transmission.remainingBits / transmission.currentRate), "Incorrect shared-rate completion time");
             const auto details = *complete->details();
             auto& direction = directions[details.sender][details.receiver];
             require(direction.active && direction.active->message.type() == details.messageType,
                 "Completion does not match the active transmission");
-            require(sameTime(event.time(), direction.active->completion), "Incorrect per-link serialization time");
+            direction.active->completion = event.time();
+            direction.active->arrival = event.time() + latency;
+            direction.arrivals.push_back(*direction.active);
             direction.active.reset();
             direction.lastCompletion = event.time();
             ++direction.completions;

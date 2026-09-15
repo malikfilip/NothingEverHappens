@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -23,16 +24,18 @@ namespace simulator {
     Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms)
         : simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
     {
+        for (std::size_t i = 0; i < peers_.size(); ++i) {
+            peer_transport_.try_emplace(peers_[i].id(), PeerTransport{i, {}, {}});
+        }
     }
 
     const Peer& Network::peer(PeerId id) const
     {
-        const auto found = std::find_if(peers_.begin(), peers_.end(),
-            [id](const Peer& peer) { return peer.id() == id; });
-        if (found == peers_.end()) {
+        const auto found = peer_transport_.find(id);
+        if (found == peer_transport_.end()) {
             throw std::invalid_argument("Unknown peer");
         }
-        return *found;
+        return peers_[found->second.peerIndex];
     }
 
     const Swarm& Network::swarm(SwarmId id) const
@@ -349,8 +352,7 @@ namespace simulator {
             throw std::logic_error("Cannot start a transmission on a busy direction");
         }
         const auto& to = peer(transmission.receiver);
-        const auto from = std::find_if(peers_.begin(), peers_.end(),
-            [sender](const Peer& candidate) { return candidate.id() == sender; });
+        auto* from = &peers_[peer_transport_.at(sender).peerIndex];
         if (transmission.message.type() == MessageType::Piece) {
             from->validatePieceTo(swarm(transmission.swarmId), to,
                 std::get<PiecePayload>(transmission.message.payload()));
@@ -364,9 +366,11 @@ namespace simulator {
             throw std::invalid_argument("Link latency must be finite and nonnegative");
         }
         const double effectiveBandwidth = std::min({
-            from->uploadCapacity(), to.downloadCapacity(), link.bandwidth()});
-        const double transmissionTime = static_cast<double>(transmission.message.wireSize()) * 8.0
-                                      / effectiveBandwidth;
+            from->uploadCapacity() / (peer_transport_.at(sender).outgoing.size() + 1),
+            to.downloadCapacity() / (peer_transport_.at(transmission.receiver).incoming.size() + 1),
+            link.bandwidth()});
+        const double bits = static_cast<double>(transmission.message.wireSize()) * 8.0;
+        const double transmissionTime = bits / effectiveBandwidth;
         const double completionTime = simulation_.currentTime() + transmissionTime;
         const double arrivalTime = completionTime + link.latency();
         if (!std::isfinite(completionTime) || !std::isfinite(arrivalTime)) {
@@ -376,22 +380,113 @@ namespace simulator {
         if (isHandshake) {
             from->markHandshakeSent(swarm(transmission.swarmId), transmission.receiver);
         }
+        auto affected = affectedTransmissions(sender, transmission.receiver);
+        accountProgress(affected);
+        const auto id = next_transmission_id_++;
+        const auto active = active_transmissions_.emplace(id, ActiveTransmission{
+            id, transmission.swarmId, sender, transmission.receiver,
+            std::move(transmission.message), index, bits,
+            effectiveBandwidth, simulation_.currentTime(), 0}).first;
+        peer_transport_.at(sender).outgoing.insert(id);
+        peer_transport_.at(transmission.receiver).incoming.insert(id);
+        recomputeRates(affected);
         direction.active = true;
         simulation_.schedule(std::make_unique<TransmissionCompleteEvent>(
-            completionTime, *this, index, sender,
-            MessageEventDetails{transmission.swarmId, sender,
-                transmission.receiver, transmission.message.type()}));
-        simulation_.schedule(std::make_unique<MessageArrivalEvent>(
-            arrivalTime, *this, transmission.swarmId, transmission.sender,
-            transmission.receiver, std::move(transmission.message)));
+            completionTime, *this, active->second));
         if (isHandshake) {
             sendInitialBitfield(*from, transmission.swarmId, transmission.receiver);
         }
     }
 
-    void Network::completeTransmission(std::size_t index, PeerId sender)
+    std::set<TransmissionId> Network::affectedTransmissions(PeerId sender, PeerId receiver) const
     {
+        auto ids = peer_transport_.at(sender).outgoing;
+        const auto& incoming = peer_transport_.at(receiver).incoming;
+        ids.insert(incoming.begin(), incoming.end());
+        return ids;
+    }
+
+    void Network::accountProgress(const std::set<TransmissionId>& ids)
+    {
+        const double now = simulation_.currentTime();
+        for (const auto id : ids) {
+            auto& active = active_transmissions_.at(id);
+            active.remainingBits = std::max(0.0, active.remainingBits
+                - active.currentRate * (now - active.lastRateUpdateTime));
+            active.lastRateUpdateTime = now;
+        }
+    }
+
+    double Network::sharedRate(const ActiveTransmission& active) const
+    {
+        const auto& sender = peer_transport_.at(active.sender);
+        const auto& receiver = peer_transport_.at(active.receiver);
+        return std::min({peers_[sender.peerIndex].uploadCapacity() / sender.outgoing.size(),
+            peers_[receiver.peerIndex].downloadCapacity() / receiver.incoming.size(),
+            links_[active.linkIndex].bandwidth()});
+    }
+
+    void Network::recomputeRates(const std::set<TransmissionId>& ids)
+    {
+        // Ordered IDs make replacement-event ordering deterministic.
+        for (const auto id : ids) {
+            const auto& active = active_transmissions_.at(id);
+            const double rate = sharedRate(active);
+            const double tolerance = 8 * std::numeric_limits<double>::epsilon()
+                * std::max(rate, active.currentRate);
+            // Always apply decreases so a skipped comparison cannot exceed a budget.
+            if (rate >= active.currentRate && rate - active.currentRate <= tolerance) continue;
+            setTransmissionRate(id, rate);
+        }
+    }
+
+    void Network::setTransmissionRate(TransmissionId id, double newRate)
+    {
+        const auto found = active_transmissions_.find(id);
+        if (found == active_transmissions_.end()) {
+            throw std::invalid_argument("Transmission is not active");
+        }
+        if (!std::isfinite(newRate) || newRate <= 0.0) {
+            throw std::invalid_argument("Transfer rate must be finite and positive");
+        }
+        auto& active = found->second;
+        const double now = simulation_.currentTime();
+        const double elapsed = now - active.lastRateUpdateTime;
+        // At a completion-time boundary, rounding can slightly overshoot the bits left.
+        const double remaining = std::max(0.0, active.remainingBits - active.currentRate * elapsed);
+        const double completionTime = now + remaining / newRate;
+        if (!std::isfinite(completionTime)
+            || !std::isfinite(completionTime + links_[active.linkIndex].latency())) {
+            throw std::invalid_argument("Transmission completion and arrival times must be finite");
+        }
+
+        active.remainingBits = remaining;
+        active.lastRateUpdateTime = now;
+        active.currentRate = newRate;
+        ++active.generation;
+        simulation_.schedule(std::make_unique<TransmissionCompleteEvent>(
+            completionTime, *this, active));
+    }
+
+    void Network::completeTransmission(TransmissionId id, std::uint64_t generation)
+    {
+        const auto found = active_transmissions_.find(id);
+        if (found == active_transmissions_.end() || found->second.generation != generation) return;
+
+        auto affected = affectedTransmissions(found->second.sender, found->second.receiver);
+        accountProgress(affected);
+        auto active = std::move(found->second);
+        active_transmissions_.erase(found);
+        peer_transport_.at(active.sender).outgoing.erase(id);
+        peer_transport_.at(active.receiver).incoming.erase(id);
+        affected.erase(id);
+        recomputeRates(affected);
+        const auto index = active.linkIndex;
+        const auto sender = active.sender;
         auto& link = links_[index];
+        simulation_.schedule(std::make_unique<MessageArrivalEvent>(
+            simulation_.currentTime() + link.latency(), *this, active.swarmId,
+            sender, active.receiver, std::move(active.message)));
         auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
         direction.active = false;
         startTransmission(index, sender);

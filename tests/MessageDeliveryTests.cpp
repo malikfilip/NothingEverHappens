@@ -370,8 +370,8 @@ struct QueueFixture {
     Simulation simulation;
     Network network;
 
-    explicit QueueFixture(double latency = 1.0)
-        : network(simulation, joinedPeers(), {Link(1, 2, 800, latency)}, {swarm}) {}
+    explicit QueueFixture(double latency = 1.0, double bandwidth = 800)
+        : network(simulation, joinedPeers(), {Link(1, 2, bandwidth, latency)}, {swarm}) {}
     std::vector<Peer> joinedPeers() {
         // Transport-only fixture: all pieces owned, so availability adds no interest traffic.
         a.joinSwarm(swarm, {0xff});
@@ -393,6 +393,807 @@ struct QueueFixture {
         return network.peer(receiver).swarmState(1).connections.at(receiver == 1 ? 2 : 1);
     }
 };
+
+// A valid 5,000,000-byte BITFIELD wire message gives exactly 40,000,000 bits.
+// All peers own every piece, so its delivery cannot generate interest traffic.
+struct MbpsFixture {
+    static constexpr std::size_t payloadBytes = 4999995;
+    Swarm swarm{1, InfoHash{0x42}, static_cast<std::uint32_t>(payloadBytes * 8)};
+    Simulation simulation;
+    Network network;
+
+    std::vector<Peer> peers(bool independent) {
+        std::vector<Peer> result;
+        for (PeerId id = 1; id <= (independent ? 4u : 2u); ++id) {
+            result.emplace_back(id, 100000000, 100000000);
+            result.back().joinSwarm(swarm, std::vector<std::uint8_t>(payloadBytes, 0xff));
+        }
+        for (std::size_t i = 0; i < result.size(); i += 2) {
+            auto& a = result[i];
+            auto& b = result[i + 1];
+            a.markHandshakeSent(swarm, b.id());
+            b.markHandshakeSent(swarm, a.id());
+            a.receiveMessage(swarm, b.id(), handshake(swarm, b.protocolId()), &b.protocolId());
+            b.receiveMessage(swarm, a.id(), handshake(swarm, a.protocolId()), &a.protocolId());
+        }
+        return result;
+    }
+    explicit MbpsFixture(double rate, bool independent = false)
+        : network(simulation, peers(independent), independent
+            ? std::vector<Link>{Link(1, 2, rate, 0.25), Link(3, 4, rate, 0.25)}
+            : std::vector<Link>{Link(1, 2, rate, 0.25)}, {swarm}) {}
+    TransmissionId start(PeerId sender = 1, PeerId receiver = 2) {
+        Message message(MessageType::Bitfield, BitfieldPayload{std::vector<std::uint8_t>(payloadBytes, 0)});
+        check(message.wireSize() * 8 == 40000000);
+        network.send(1, sender, receiver, std::move(message));
+        for (const auto& [id, active] : network.activeTransmissions()) {
+            if (active.sender == sender && active.receiver == receiver) return id;
+        }
+        throw std::runtime_error("Expected active Mbps transmission");
+    }
+    void at(double time, std::function<void()> action) {
+        simulation.schedule(std::make_unique<CheckEvent>(time, std::move(action)));
+    }
+};
+
+void checkRateRecord(const ActiveTransmission& actual, const ActiveTransmission& expected)
+{
+    check(actual.id == expected.id && actual.sender == expected.sender && actual.receiver == expected.receiver);
+    check(actual.swarmId == expected.swarmId && actual.linkIndex == expected.linkIndex);
+    check(actual.remainingBits == expected.remainingBits && actual.currentRate == expected.currentRate);
+    check(actual.lastRateUpdateTime == expected.lastRateUpdateTime && actual.generation == expected.generation);
+    check(actual.message.type() == expected.message.type() && actual.message.wireSize() == expected.message.wireSize());
+}
+
+struct RateExpectation { double time, rate, remaining; };
+
+void exerciseMbpsRates(double initialRate, std::vector<RateExpectation> changes,
+                      double completion, bool auditStale = false)
+{
+    MbpsFixture f(initialRate);
+    const auto id = f.start();
+    check(f.network.activeTransmissions().at(id).currentRate == initialRate);
+    f.network.send(1, 1, 2, Message(MessageType::Unchoke));
+    unsigned stale = 0, valid = 0, firstArrivals = 0, secondStarts = 0, secondArrivals = 0;
+    unsigned completionEffects = 0, staleAudits = 0;
+    std::vector<double> predictions{40000000.0 / initialRate};
+    for (const auto& change : changes) predictions.push_back(change.time + change.remaining / change.rate);
+    f.simulation.setEventObserver([&](const Event& event) {
+        if (const auto* tx = dynamic_cast<const TransmissionCompleteEvent*>(&event);
+            tx && tx->transmissionId() == id) {
+            check(std::abs(event.time() - predictions.at(tx->generation())) < 1e-12);
+            if (tx->generation() == changes.size()) {
+                ++valid;
+                check(std::abs(event.time() - completion) < 1e-12);
+                check(f.network.activeTransmissions().contains(id));
+                check(f.network.transmissionState(1, 2).pendingCount == 1);
+                f.at(event.time(), [&] {
+                    check(!f.network.activeTransmissions().contains(id));
+                    check(secondStarts == 1);
+                    ++completionEffects;
+                });
+            } else {
+                ++stale;
+                if (auditStale) {
+                    // Audit obsolete completions both during and after the active lifetime,
+                    // away from other event timestamps. Snapshot immediately around execution.
+                    const auto active = f.network.activeTransmissions();
+                    const auto direction = f.network.transmissionState(1, 2);
+                    const auto a = f.network.peer(1).swarmState(1);
+                    const auto b = f.network.peer(2).swarmState(1);
+                    const auto startsBefore = secondStarts;
+                    const auto arrivalsBefore = firstArrivals + secondArrivals;
+                    f.at(event.time(), [&, active, direction, a, b, startsBefore, arrivalsBefore] {
+                        check(f.network.activeTransmissions().size() == active.size());
+                        for (const auto& [activeId, before] : active) {
+                            checkRateRecord(f.network.activeTransmissions().at(activeId), before);
+                        }
+                        check(f.network.transmissionState(1, 2).active == direction.active);
+                        check(f.network.transmissionState(1, 2).pendingCount == direction.pendingCount);
+                        check(secondStarts == startsBefore && firstArrivals + secondArrivals == arrivalsBefore);
+                        checkUnchanged(f.network.peer(1).swarmState(1), a);
+                        checkUnchanged(f.network.peer(2).swarmState(1), b);
+                        ++staleAudits;
+                    });
+                }
+            }
+        }
+        if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+            start && start->message().type() == MessageType::Unchoke) {
+            ++secondStarts;
+            check(valid == 1 && !f.network.activeTransmissions().contains(id));
+            check(std::abs(event.time() - completion) < 1e-12);
+        }
+        if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event)) {
+            if (arrival->details().messageType == MessageType::Bitfield) {
+                ++firstArrivals;
+                check(valid == 1 && std::abs(event.time() - (completion + 0.25)) < 1e-12);
+            } else {
+                check(arrival->details().messageType == MessageType::Unchoke);
+                ++secondArrivals;
+                check(std::abs(event.time() - (completion + 40 / initialRate + 0.25)) < 1e-12);
+            }
+        }
+    });
+    for (std::size_t i = 0; i < changes.size(); ++i) {
+        const auto change = changes[i];
+        f.at(change.time, [&, change, i] {
+            f.network.setTransmissionRate(id, change.rate);
+            const auto& active = f.network.activeTransmissions().at(id);
+            check(active.remainingBits >= 0);
+            check(std::abs(active.remainingBits - change.remaining) < 1e-6);
+            check(active.currentRate == change.rate && active.lastRateUpdateTime == change.time);
+            check(active.generation == i + 1);
+            check(f.network.transmissionState(1, 2).active && f.network.transmissionState(1, 2).pendingCount == 1);
+        });
+    }
+    f.simulation.run();
+    check(stale == changes.size() && valid == 1 && completionEffects == 1);
+    check(firstArrivals == 1 && secondStarts == 1 && secondArrivals == 1);
+    check(!auditStale || staleAudits == stale);
+    check(f.network.activeTransmissions().empty() && !f.network.transmissionState(1, 2).active);
+    check(!f.network.peer(2).swarmState(1).connections.at(1).remoteIsChokingUs);
+}
+
+void mbpsSlowdown() { exerciseMbpsRates(10000000, {{2, 5000000, 20000000}}, 6, true); }
+void mbpsSpeedup() { exerciseMbpsRates(5000000, {{2, 10000000, 30000000}}, 5); }
+void mbpsMultipleChanges() {
+    // First 2 s transfer 20 Mbit; next 1 s transfers 5 Mbit; final 15 Mbit takes .75 s.
+    exerciseMbpsRates(10000000, {{2, 5000000, 20000000}, {3, 20000000, 15000000}}, 3.75);
+}
+void mbpsSameStartTime() { exerciseMbpsRates(10000000, {{0, 5000000, 40000000}}, 8, true); }
+void mbpsNearCompletion() {
+    const double time = std::nextafter(4.0, 0.0);
+    // Independent higher-precision interval calculation; less than one microbit remains.
+    const double remaining = static_cast<double>((4.0L - static_cast<long double>(time)) * 10000000.0L);
+    exerciseMbpsRates(10000000, {{time, 5000000, remaining}}, time + remaining / 5000000);
+}
+void mbpsStaleSafety() {
+    // Obsolete predictions t=4,7,12 all execute while generation 3 still owns the FIFO.
+    exerciseMbpsRates(10000000,
+        {{1, 5000000, 30000000}, {2, 2500000, 25000000}, {3, 1250000, 22500000}}, 21, true);
+}
+void mbpsFifo() {
+    exerciseMbpsRates(10000000,
+        {{1, 5000000, 30000000}, {2, 10000000, 25000000}, {3, 5000000, 15000000}}, 6, true);
+}
+void mbpsUniqueness() {
+    // Several completions become stale even when overrides share the same timestamp.
+    exerciseMbpsRates(10000000,
+        {{2, 5000000, 20000000}, {2, 10000000, 20000000}, {2, 20000000, 20000000}}, 3);
+}
+
+void mbpsUnaffected(bool independent)
+{
+    std::vector<std::pair<int, double>> baseline;
+    for (bool overrideRate : {false, true}) {
+        MbpsFixture f(10000000, independent);
+        const auto first = f.start();
+        const PeerId sender = independent ? 3 : 2, receiver = independent ? 4 : 1;
+        const auto other = f.start(sender, receiver);
+        const auto original = f.network.activeTransmissions().at(other);
+        f.network.send(1, sender, receiver, Message(MessageType::Unchoke));
+        std::vector<std::pair<int, double>> trace;
+        unsigned starts = 0, completions = 0, arrivals = 0;
+        f.simulation.setEventObserver([&](const Event& event) {
+            if (const auto* tx = dynamic_cast<const TransmissionCompleteEvent*>(&event);
+                tx && tx->details() && tx->details()->sender == sender) {
+                ++completions;
+                trace.emplace_back(0, event.time());
+                check(tx->generation() == 0);
+                if (tx->transmissionId() == other) {
+                    check(event.time() == 4);
+                    checkRateRecord(f.network.activeTransmissions().at(other), original);
+                } else check(std::abs(event.time() - 4.000004) < 1e-12);
+            }
+            if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+                start && start->details().sender == sender) {
+                ++starts;
+                trace.emplace_back(1, event.time());
+                check(event.time() == 4 && completions == 1);
+            }
+            if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event);
+                arrival && arrival->details().sender == sender) {
+                ++arrivals;
+                trace.emplace_back(2, event.time());
+            }
+        });
+        f.at(2, [&] {
+            if (overrideRate) f.network.setTransmissionRate(first, 5000000);
+            const auto& active = f.network.activeTransmissions().at(other);
+            checkRateRecord(active, original);
+            // remainingBits is anchored to lastRateUpdateTime; derived progress is 20 Mbit.
+            check(active.remainingBits - active.currentRate * (f.simulation.currentTime() - active.lastRateUpdateTime) == 20000000);
+            check(f.network.transmissionState(sender, receiver).active);
+            check(f.network.transmissionState(sender, receiver).pendingCount == 1);
+        });
+        f.simulation.run();
+        check(starts == 1 && completions == 2 && arrivals == 2);
+        check(!f.network.transmissionState(sender, receiver).active);
+        check(!f.network.peer(receiver).swarmState(1).connections.at(sender).remoteIsChokingUs);
+        if (!overrideRate) baseline = trace;
+        else check(trace == baseline);
+    }
+}
+void mbpsFullDuplex() { mbpsUnaffected(false); }
+void mbpsIndependentLink() { mbpsUnaffected(true); }
+
+struct SharingFixture {
+    Swarm swarm{1, InfoHash{0x42}, 8};
+    Simulation simulation;
+    Network network;
+    std::vector<Peer> peers(const std::vector<double>& upload, const std::vector<double>& download) {
+        std::vector<Peer> result;
+        for (PeerId id = 1; id <= 4; ++id) {
+            result.emplace_back(id, upload[id - 1], download[id - 1]);
+            result.back().joinSwarm(swarm, {0xff});
+        }
+        for (auto& a : result) for (auto& b : result) if (a.id() != b.id()) {
+            a.markHandshakeSent(swarm, b.id());
+            a.receiveMessage(swarm, b.id(), handshake(swarm, b.protocolId()), &b.protocolId());
+        }
+        return result;
+    }
+    explicit SharingFixture(std::vector<double> upload = {1e7, 1e8, 1e8, 1e8},
+                            std::vector<double> download = {1e8, 1e8, 1e8, 1e8},
+                            double link12 = 1e8)
+        : network(simulation, peers(upload, download),
+            {Link(1, 2, link12, .25), Link(1, 3, 1e8, .25), Link(1, 4, 1e8, .25),
+             Link(2, 3, 1e8, .25), Link(2, 4, 1e8, .25), Link(3, 4, 1e8, .25)}, {swarm}) {}
+    TransmissionId send(PeerId sender, PeerId receiver, bool shortMessage = false) {
+        network.send(1, sender, receiver, shortMessage ? Message(MessageType::Unchoke)
+            : Message(MessageType::Cancel, CancelPayload{}));
+        invariant();
+        for (const auto& [id, active] : network.activeTransmissions()) {
+            if (active.sender == sender && active.receiver == receiver) return id;
+        }
+        throw std::runtime_error("Missing active sharing transmission");
+    }
+    const ActiveTransmission& active(TransmissionId id) const { return network.activeTransmissions().at(id); }
+    void at(double time, std::function<void()> action) {
+        simulation.schedule(std::make_unique<CheckEvent>(time, std::move(action)));
+    }
+    void invariant() const {
+        std::map<PeerId, double> outgoing, incoming;
+        std::set<std::pair<PeerId, PeerId>> directions;
+        for (const auto& [id, active] : network.activeTransmissions()) {
+            check(active.remainingBits >= 0 && std::isfinite(active.currentRate) && active.currentRate > 0);
+            check(directions.emplace(active.sender, active.receiver).second);
+            outgoing[active.sender] += active.currentRate;
+            incoming[active.receiver] += active.currentRate;
+        }
+        for (PeerId id = 1; id <= 4; ++id) {
+            check(outgoing[id] <= network.peer(id).uploadCapacity() * (1 + 1e-14));
+            check(incoming[id] <= network.peer(id).downloadCapacity() * (1 + 1e-14));
+        }
+    }
+};
+
+void equalShareExplicitSixFourFour()
+{
+    std::vector<std::pair<TransmissionId, double>> baseline;
+    for (int run = 0; run < 2; ++run) {
+        SharingFixture f({12e6, 1e6, 100e6, 20e6}, {100e6, 20e6, 8e6, 100e6});
+        // P2 -> P4 uses upload(P2)/download(P4), neither of the contested budgets.
+        // At 1 Mbps it remains active throughout all three relevant completions.
+        const auto unrelated = f.send(2, 4);
+        const auto unchanged = f.active(unrelated);
+        const auto toTwo = f.send(1, 2);       // CANCEL: 136 wire bits.
+        const auto toThree = f.send(1, 3, true); // UNCHOKE: 40 wire bits; finishes first.
+        const auto fromFour = f.send(4, 3);    // CANCEL: 136 wire bits.
+        const auto beforeTwo = f.active(toTwo), beforeFour = f.active(fromFour);
+        check(beforeTwo.currentRate == 6e6);
+        check(f.active(toThree).currentRate == 4e6 && beforeFour.currentRate == 4e6);
+        const double outgoingOne = beforeTwo.currentRate + f.active(toThree).currentRate;
+        check(outgoingOne == 10e6 && outgoingOne <= f.network.peer(1).uploadCapacity());
+        check(f.active(toThree).currentRate + beforeFour.currentRate == 8e6);
+        checkRateRecord(f.active(unrelated), unchanged);
+
+        // At t=10 us, P1 -> P3 finishes 40 bits at 4 Mbps.
+        // P1 -> P2 has sent 60 bits at 6 Mbps: 76 remain, now at 12 Mbps.
+        // P4 -> P3 has sent 40 bits at 4 Mbps: 96 remain, now at 8 Mbps.
+        const double firstCompletion = 10e-6;
+        const double twoCompletion = firstCompletion + 76.0 / 12e6;
+        const double fourCompletion = firstCompletion + 96.0 / 8e6;
+        std::map<TransmissionId, double> expected{
+            {toThree, firstCompletion}, {toTwo, twoCompletion},
+            {fromFour, fourCompletion}, {unrelated, 136.0 / 1e6}};
+        std::map<TransmissionId, unsigned> valid, stale;
+        std::map<std::pair<PeerId, PeerId>, unsigned> arrivals;
+        std::vector<std::pair<TransmissionId, double>> trace;
+        f.simulation.setEventObserver([&](const Event& event) {
+            f.invariant();
+            if (f.network.activeTransmissions().contains(unrelated)) {
+                checkRateRecord(f.active(unrelated), unchanged);
+            }
+            if (const auto* tx = dynamic_cast<const TransmissionCompleteEvent*>(&event)) {
+                const auto found = f.network.activeTransmissions().find(tx->transmissionId());
+                if (found == f.network.activeTransmissions().end() || found->second.generation != tx->generation()) {
+                    ++stale[tx->transmissionId()];
+                } else {
+                    ++valid[tx->transmissionId()];
+                    check(std::abs(event.time() - expected.at(tx->transmissionId())) < 1e-15);
+                    trace.emplace_back(tx->transmissionId(), event.time());
+                }
+            }
+            if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event)) {
+                const auto details = arrival->details();
+                ++arrivals[{details.sender, details.receiver}];
+                const auto id = details.sender == 2 ? unrelated : details.sender == 4 ? fromFour
+                    : details.receiver == 2 ? toTwo : toThree;
+                check(valid[id] == 1);
+                check(std::abs(event.time() - (expected.at(id) + .25)) < 1e-15);
+            }
+        });
+        f.at(firstCompletion, [&] {
+            check(valid[toThree] == 1 && !f.network.activeTransmissions().contains(toThree));
+            const auto& two = f.active(toTwo);
+            const auto& four = f.active(fromFour);
+            check(std::abs(two.remainingBits - 76) < 1e-12 && two.currentRate == 12e6);
+            check(std::abs(four.remainingBits - 96) < 1e-12 && four.currentRate == 8e6);
+            check(two.lastRateUpdateTime == firstCompletion && four.lastRateUpdateTime == firstCompletion);
+            check(two.generation == beforeTwo.generation + 1 && four.generation == beforeFour.generation + 1);
+            checkRateRecord(f.active(unrelated), unchanged);
+        });
+        f.simulation.run();
+        for (const auto& [id, time] : expected) check(valid[id] == 1);
+        check(stale[toTwo] >= 1 && stale[fromFour] == 1 && stale[unrelated] == 0);
+        check(arrivals.size() == 4);
+        for (const auto& [direction, count] : arrivals) check(count == 1);
+        check(f.network.activeTransmissions().empty());
+        if (run == 0) baseline = trace;
+        else check(trace == baseline);
+    }
+}
+
+void equalShareUpload()
+{
+    SharingFixture f;
+    const auto a = f.send(1, 2), b = f.send(1, 3);
+    check(f.active(a).currentRate == 5e6 && f.active(b).currentRate == 5e6);
+    check(f.active(a).remainingBits == 136 && f.active(b).remainingBits == 136);
+    f.simulation.run();
+    check(f.network.activeTransmissions().empty());
+}
+
+void equalShareUploadRelease()
+{
+    SharingFixture f;
+    const auto shortId = f.send(1, 2, true), longId = f.send(1, 3);
+    unsigned valid = 0, stale = 0, arrivals = 0;
+    f.simulation.setEventObserver([&](const Event& event) {
+        f.invariant();
+        if (const auto* tx = dynamic_cast<const TransmissionCompleteEvent*>(&event);
+            tx && tx->transmissionId() == longId) {
+            const auto found = f.network.activeTransmissions().find(longId);
+            if (found == f.network.activeTransmissions().end() || found->second.generation != tx->generation()) {
+                ++stale;
+                check(std::abs(event.time() - 27.2e-6) < 1e-15);
+            } else {
+                ++valid;
+                check(std::abs(event.time() - 17.6e-6) < 1e-15);
+            }
+        }
+        if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event);
+            arrival && arrival->details().receiver == 3) {
+            ++arrivals;
+            check(std::abs(event.time() - (.25 + 17.6e-6)) < 1e-15);
+        }
+    });
+    f.at(9e-6, [&] {
+        check(!f.network.activeTransmissions().contains(shortId));
+        const auto& active = f.active(longId);
+        // 5 Mbps * 8 microseconds = 40 bits sent; 96 bits remain.
+        check(std::abs(active.remainingBits - 96) < 1e-12);
+        check(active.currentRate == 1e7 && active.generation == 1);
+        check(std::abs(active.lastRateUpdateTime - 8e-6) < 1e-15);
+    });
+    f.simulation.run();
+    check(valid == 1 && stale == 1 && arrivals == 1);
+}
+
+void equalShareDownload()
+{
+    SharingFixture f({1e8, 1e8, 1e8, 1e8}, {1e8, 1e8, 1e7, 1e8});
+    const auto a = f.send(1, 3), b = f.send(2, 3);
+    check(f.active(a).currentRate == 5e6 && f.active(b).currentRate == 5e6);
+    f.simulation.run();
+}
+
+void equalShareEndpointLimits()
+{
+    SharingFixture f({12e6, 1e8, 1e8, 1e8}, {1e8, 1e8, 1e7, 1e8}, 2e6);
+    const auto a = f.send(1, 3), b = f.send(1, 2), c = f.send(4, 3);
+    check(f.active(a).currentRate == 5e6); // min(6 Mbps upload, 5 Mbps download, 100 Mbps link).
+    check(f.active(b).currentRate == 2e6 && f.active(c).currentRate == 5e6);
+    f.simulation.run();
+}
+
+void equalShareLinkCapUnchanged()
+{
+    SharingFixture f({1e7, 1e8, 1e8, 1e8}, {1e8, 1e8, 1e8, 1e8}, 1e6);
+    const auto a = f.send(1, 2);
+    f.at(2e-6, [&] {
+        const auto b = f.send(1, 3);
+        check(f.active(a).currentRate == 1e6 && f.active(a).generation == 0);
+        check(f.active(a).remainingBits == 134); // Progress updated, no redundant completion scheduled.
+        check(f.active(b).currentRate == 5e6); // Unused share is not redistributed.
+    });
+    unsigned completions = 0;
+    f.simulation.setEventObserver([&](const Event& event) {
+        if (const auto* tx = dynamic_cast<const TransmissionCompleteEvent*>(&event);
+            tx && tx->transmissionId() == a) {
+            ++completions;
+            check(tx->generation() == 0 && std::abs(event.time() - 136e-6) < 1e-15);
+        }
+    });
+    f.simulation.run();
+    check(completions == 1);
+}
+
+void equalShareUnrelated()
+{
+    SharingFixture isolated;
+    const auto id = isolated.send(3, 4);
+    const auto before = isolated.active(id);
+    isolated.send(1, 2, true);
+    isolated.send(2, 1, true);
+    checkRateRecord(isolated.active(id), before);
+    unsigned completions = 0;
+    isolated.simulation.setEventObserver([&](const Event& event) {
+        if (const auto* tx = dynamic_cast<const TransmissionCompleteEvent*>(&event);
+            tx && tx->transmissionId() == id) {
+            ++completions;
+            checkRateRecord(isolated.active(id), before);
+            check(std::abs(event.time() - 1.36e-6) < 1e-15 && tx->generation() == 0);
+        }
+    });
+    isolated.simulation.run();
+    check(completions == 1);
+}
+
+void equalShareFifo()
+{
+    SharingFixture f;
+    f.send(1, 2, true);
+    const auto b = f.send(1, 3);
+    f.send(1, 2); // FIFO entry, not a third flow.
+    check(f.network.activeTransmissions().size() == 2 && f.active(b).currentRate == 5e6);
+    check(f.network.transmissionState(1, 2).pendingCount == 1);
+    unsigned starts = 0;
+    f.simulation.setEventObserver([&](const Event& event) {
+        f.invariant();
+        if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+            start && start->details().receiver == 2) {
+            ++starts;
+            check(std::abs(event.time() - 8e-6) < 1e-15);
+        }
+    });
+    f.at(9e-6, [&] {
+        check(starts == 1 && f.network.transmissionState(1, 2).pendingCount == 0);
+        check(f.active(b).currentRate == 5e6 && std::abs(f.active(b).remainingBits - 96) < 1e-12);
+    });
+    f.simulation.run();
+    check(starts == 1);
+}
+
+void equalShareDuplex()
+{
+    SharingFixture f({1e7, 8e6, 1e8, 1e8}, {6e6, 2e7, 1e8, 1e8});
+    const auto a = f.send(1, 2), b = f.send(2, 1);
+    const auto reverse = f.active(b);
+    check(f.active(a).currentRate == 1e7 && reverse.currentRate == 6e6);
+    f.send(1, 3);
+    check(f.active(a).currentRate == 5e6);
+    checkRateRecord(f.active(b), reverse);
+    f.simulation.run();
+}
+
+void equalShareSameTimestamp()
+{
+    std::vector<std::pair<TransmissionId, double>> baseline;
+    for (int run = 0; run < 2; ++run) {
+        SharingFixture f;
+        for (PeerId receiver : {2u, 3u, 4u}) {
+            f.simulation.schedule(std::make_unique<SendMessageEvent>(0, f.network, 1, 1, receiver,
+                Message(MessageType::Cancel, CancelPayload{})));
+        }
+        f.at(0, [&] {
+            check(f.network.activeTransmissions().size() == 3);
+            for (const auto& [id, active] : f.network.activeTransmissions()) {
+                check(active.remainingBits == 136 && active.lastRateUpdateTime == 0);
+                check(active.currentRate == 1e7 / 3);
+            }
+        });
+        std::vector<std::pair<TransmissionId, double>> trace;
+        f.simulation.setEventObserver([&](const Event& event) {
+            f.invariant();
+            if (const auto* tx = dynamic_cast<const TransmissionCompleteEvent*>(&event)) {
+                const auto found = f.network.activeTransmissions().find(tx->transmissionId());
+                if (found != f.network.activeTransmissions().end() && found->second.generation == tx->generation()) {
+                    check(std::abs(event.time() - 40.8e-6) < 1e-15);
+                    trace.emplace_back(tx->transmissionId(), event.time());
+                }
+            }
+        });
+        f.simulation.run();
+        check(trace.size() == 3);
+        if (run == 0) baseline = trace;
+        else check(trace == baseline);
+    }
+}
+
+void equalShareAggregateTransitions()
+{
+    SharingFixture f({1e7, 12e6, 8e6, 16e6}, {6e6, 14e6, 1e7, 9e6}, 2e6);
+    unsigned observations = 0;
+    f.simulation.setEventObserver([&](const Event& event) {
+        f.invariant();
+        ++observations;
+        if (!dynamic_cast<const CheckEvent*>(&event)) f.at(event.time(), [&] { f.invariant(); });
+    });
+    for (PeerId sender = 1; sender <= 4; ++sender) for (PeerId receiver = 1; receiver <= 4; ++receiver) {
+        if (sender == receiver) continue;
+        f.simulation.schedule(std::make_unique<SendMessageEvent>((sender - 1) * 1e-6,
+            f.network, 1, sender, receiver, Message(MessageType::Cancel, CancelPayload{})));
+        f.simulation.schedule(std::make_unique<SendMessageEvent>((sender - 1) * 1e-6,
+            f.network, 1, sender, receiver, Message(MessageType::Unchoke)));
+    }
+    f.simulation.run();
+    check(observations > 100 && f.network.activeTransmissions().empty());
+}
+
+void equalShareStartProgress()
+{
+    SharingFixture f;
+    const auto a = f.send(1, 2);
+    f.at(2e-6, [&] {
+        const auto b = f.send(1, 3);
+        check(f.active(a).remainingBits == 116 && f.active(a).lastRateUpdateTime == 2e-6);
+        check(f.active(a).currentRate == 5e6 && f.active(b).remainingBits == 136);
+    });
+    f.simulation.run();
+}
+
+void dynamicTransmissionRateMath()
+{
+    for (double newRate : {5.0, 20.0}) {
+        QueueFixture f(0.5, 10);
+        f.network.send(1, 1, 2, Message(MessageType::Unchoke)); // 40 bits: original completion t=4.
+        const auto id = f.network.activeTransmissions().begin()->first;
+        f.network.send(1, 1, 2, Message(MessageType::Choke));
+        const double expected = 2.0 + 20.0 / newRate;
+        unsigned stale = 0, valid = 0, arrivals = 0;
+        f.simulation.setEventObserver([&](const Event& event) {
+            if (const auto* complete = dynamic_cast<const TransmissionCompleteEvent*>(&event);
+                complete && complete->transmissionId() == id) {
+                if (complete->generation() == 0) {
+                    ++stale;
+                    check(event.time() == 4.0);
+                    const auto before = f.network.activeTransmissions().begin()->second;
+                    const auto pending = f.network.transmissionState(1, 2).pendingCount;
+                    const auto peerBefore = f.network.peer(2).swarmState(1);
+                    f.observe(event.time(), [&, before, pending, peerBefore] {
+                        const auto& after = f.network.activeTransmissions().at(before.id);
+                        check(after.generation == before.generation);
+                        check(after.remainingBits == before.remainingBits && after.currentRate == before.currentRate);
+                        check(after.lastRateUpdateTime == before.lastRateUpdateTime);
+                        check(f.network.transmissionState(1, 2).active);
+                        check(f.network.transmissionState(1, 2).pendingCount == pending);
+                        checkUnchanged(f.network.peer(2).swarmState(1), peerBefore);
+                    });
+                } else {
+                    ++valid;
+                    check(complete->generation() == 1 && event.time() == expected);
+                    check(f.network.activeTransmissions().contains(id));
+                    check(f.network.transmissionState(1, 2).pendingCount == 1);
+                }
+            }
+            if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+                start && start->message().type() == MessageType::Choke) {
+                check(event.time() == expected && valid == 1);
+                check(!f.network.activeTransmissions().contains(id));
+            }
+            if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event);
+                arrival && arrival->details().messageType == MessageType::Unchoke) {
+                ++arrivals;
+                check(event.time() == expected + 0.5 && valid == 1);
+            }
+        });
+        f.observe(2.0, [&] {
+            f.network.setTransmissionRate(id, newRate);
+            const auto& active = f.network.activeTransmissions().at(id);
+            check(active.remainingBits == 20.0 && active.currentRate == newRate);
+            check(active.lastRateUpdateTime == 2.0 && active.generation == 1);
+            check(f.network.transmissionState(1, 2).pendingCount == 1);
+        });
+        f.simulation.run();
+        check(stale == 1 && valid == 1 && arrivals == 1);
+        check(f.network.activeTransmissions().empty() && f.remote().remoteIsChokingUs);
+        // The following message still uses the original effective bandwidth (10).
+        check(f.simulation.currentTime() == expected + 4.0 + 0.5);
+    }
+}
+
+void repeatedTransmissionRateChanges()
+{
+    QueueFixture f(0.5, 10);
+    f.network.send(1, 1, 2, Message(MessageType::Unchoke));
+    const auto id = f.network.activeTransmissions().begin()->first;
+    unsigned completions = 0, arrivals = 0;
+    f.observe(2.0, [&] { f.network.setTransmissionRate(id, 5); });
+    f.observe(3.0, [&] {
+        f.network.setTransmissionRate(id, 20);
+        const auto& active = f.network.activeTransmissions().at(id);
+        check(active.remainingBits == 15 && active.lastRateUpdateTime == 3);
+        check(active.generation == 2);
+    });
+    f.simulation.setEventObserver([&](const Event& event) {
+        if (const auto* complete = dynamic_cast<const TransmissionCompleteEvent*>(&event)) {
+            ++completions;
+            if (complete->generation() == 2) check(event.time() == 3.75);
+            else check(!f.network.activeTransmissions().contains(id));
+        }
+        if (dynamic_cast<const MessageArrivalEvent*>(&event)) {
+            ++arrivals;
+            check(event.time() == 4.25);
+        }
+    });
+    f.simulation.run();
+    check(completions == 3 && arrivals == 1);
+    check(!f.remote().remoteIsChokingUs && f.network.activeTransmissions().empty());
+}
+
+void transmissionRateValidationAndBoundary()
+{
+    QueueFixture f(0.5, 10);
+    TransmissionId id = 0;
+    // Insert before the original completion so the override wins the timestamp tie.
+    f.observe(4.0, [&] {
+        f.network.setTransmissionRate(id, 7);
+        const auto& active = f.network.activeTransmissions().at(id);
+        check(active.remainingBits == 0 && active.generation == 1);
+        check(active.lastRateUpdateTime == 4);
+    });
+    f.network.send(1, 1, 2, Message(MessageType::Unchoke));
+    id = f.network.activeTransmissions().begin()->first;
+    f.observe(2.0, [&] {
+        for (double rate : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::quiet_NaN(),
+                            std::numeric_limits<double>::denorm_min()}) {
+            rejects([&] { f.network.setTransmissionRate(id, rate); });
+        }
+        rejects([&] { f.network.setTransmissionRate(id + 100, 10); });
+        const auto& active = f.network.activeTransmissions().at(id);
+        check(active.remainingBits == 40 && active.currentRate == 10);
+        check(active.lastRateUpdateTime == 0 && active.generation == 0);
+    });
+    unsigned arrivals = 0, completions = 0;
+    f.simulation.setEventObserver([&](const Event& event) {
+        if (dynamic_cast<const TransmissionCompleteEvent*>(&event)) {
+            check(event.time() == 4);
+            ++completions;
+        }
+        if (dynamic_cast<const MessageArrivalEvent*>(&event)) {
+            check(event.time() == 4.5);
+            ++arrivals;
+        }
+    });
+    f.simulation.run();
+    check(arrivals == 1 && completions == 2);
+    rejects([&] { f.network.setTransmissionRate(id, 10); });
+}
+
+void activeTransmissionLifecycle()
+{
+    QueueFixture f;
+    check(f.network.activeTransmissions().empty());
+    unsigned starts = 0;
+    f.simulation.setEventObserver([&](const Event& event) {
+        if (dynamic_cast<const TransmissionStartEvent*>(&event)) {
+            // Observer runs before Start executes: the FIFO front is not active yet.
+            check(!f.network.transmissionState(1, 2).active);
+            check(f.network.activeTransmissions().empty());
+            ++starts;
+        }
+    });
+    f.network.send(1, 1, 2, Message(MessageType::Unchoke));
+    const auto first = f.network.activeTransmissions().begin()->second;
+    check(first.id != 0 && first.sender == 1 && first.receiver == 2 && first.swarmId == 1);
+    check(first.message.type() == MessageType::Unchoke);
+    check(first.remainingBits == 40 && first.currentRate == 800);
+    check(first.lastRateUpdateTime == 0 && first.generation == 0);
+    f.network.send(1, 1, 2, Message(MessageType::Have, HavePayload{7}));
+    check(f.network.activeTransmissions().size() == 1);
+    check(f.network.transmissionState(1, 2).pendingCount == 1);
+    f.observe(0.051, [&] {
+        check(f.network.activeTransmissions().size() == 1);
+        const auto& second = f.network.activeTransmissions().begin()->second;
+        check(second.id != first.id && second.message.type() == MessageType::Have);
+        check(second.remainingBits == 72 && second.currentRate == 800);
+        check(std::abs(second.lastRateUpdateTime - 0.05) < 1e-12);
+        check(f.network.transmissionState(1, 2).pendingCount == 0);
+    });
+    f.observe(0.141, [&] {
+        check(f.network.activeTransmissions().empty());
+        check(!f.network.transmissionState(1, 2).active);
+        check(f.remote().remoteIsChokingUs); // Still propagating.
+    });
+    f.simulation.run();
+    check(starts == 2 && f.network.activeTransmissions().empty());
+    check(!f.remote().remoteIsChokingUs);
+}
+
+void arrivalScheduledByCompletion()
+{
+    for (double latency : {0.0, 1.0}) {
+        QueueFixture f(latency);
+        bool markerRan = false;
+        unsigned arrivals = 0, completions = 0;
+        f.simulation.setEventObserver([&](const Event& event) {
+            if (dynamic_cast<const TransmissionCompleteEvent*>(&event)) {
+                ++completions;
+                check(f.network.activeTransmissions().size() == 1);
+                // Enqueued immediately before completion executes. An arrival already
+                // scheduled at Start would precede this marker at the same timestamp.
+                f.observe(event.time() + latency, [&] { markerRan = true; });
+            }
+            if (dynamic_cast<const MessageArrivalEvent*>(&event)) {
+                check(markerRan && completions == 1);
+                check(f.network.activeTransmissions().empty());
+                check(std::abs(event.time() - (0.05 + latency)) < 1e-12);
+                ++arrivals;
+            }
+        });
+        f.network.send(1, 1, 2, Message(MessageType::Unchoke));
+        f.simulation.run();
+        check(arrivals == 1 && !f.remote().remoteIsChokingUs);
+    }
+}
+
+void staleCompletionNoOp()
+{
+    QueueFixture f;
+    unsigned starts = 0, arrivals = 0;
+    f.simulation.setEventObserver([&](const Event& event) {
+        if (dynamic_cast<const TransmissionStartEvent*>(&event)) ++starts;
+        if (dynamic_cast<const MessageArrivalEvent*>(&event)) ++arrivals;
+    });
+    f.network.send(1, 1, 2, Message(MessageType::Unchoke));
+    f.network.send(1, 1, 2, Message(MessageType::Have, HavePayload{7}));
+    const auto first = f.network.activeTransmissions().begin()->second;
+    auto stale = first;
+    ++stale.generation;
+    f.simulation.schedule(std::make_unique<TransmissionCompleteEvent>(0.01, f.network, stale));
+    // Unknown ID is also harmless.
+    stale.id += 100;
+    f.simulation.schedule(std::make_unique<TransmissionCompleteEvent>(0.02, f.network, stale));
+    f.observe(0.03, [&] {
+        const auto& actual = f.network.activeTransmissions().at(first.id);
+        check(actual.remainingBits == first.remainingBits && actual.currentRate == first.currentRate);
+        check(actual.lastRateUpdateTime == first.lastRateUpdateTime && actual.generation == first.generation);
+        check(f.network.transmissionState(1, 2).active);
+        check(f.network.transmissionState(1, 2).pendingCount == 1);
+        check(starts == 1 && arrivals == 0);
+        checkUnchanged(f.network.peer(1).swarmState(1), f.a.swarmState(1));
+        checkUnchanged(f.network.peer(2).swarmState(1), f.b.swarmState(1));
+    });
+    // Old ID must not release the second message's direction. Exercise the
+    // compatibility constructor too: it captures the first ID at construction.
+    f.simulation.schedule(std::make_unique<TransmissionCompleteEvent>(
+        0.06, f.network, first.linkIndex, first.sender));
+    f.observe(0.07, [&] {
+        check(f.network.activeTransmissions().size() == 1);
+        check(f.network.activeTransmissions().begin()->first != first.id);
+        check(f.network.transmissionState(1, 2).active && starts == 2 && arrivals == 0);
+        checkUnchanged(f.network.peer(2).swarmState(1), f.b.swarmState(1));
+    });
+    f.simulation.schedule(std::make_unique<TransmissionCompleteEvent>(0.2, f.network, first));
+    f.simulation.run();
+    check(starts == 2 && arrivals == 2 && f.network.activeTransmissions().empty());
+    check(!f.remote().remoteIsChokingUs && f.remote().remoteBitfield[0] == 1);
+    check(std::abs(f.simulation.currentTime() - 1.14) < 1e-12);
+}
 
 void serializedTransmissionAndLatency()
 {
@@ -1419,17 +2220,18 @@ void completionHaveScopeFifoAndInterest()
 {
     const Swarm swarm(1, InfoHash{1}, 20, 16); // Four-byte final piece.
     const Swarm other(2, InfoHash{2}, 20, 16);
+    // Keep this protocol/FIFO regression link-limited with noncontended peer budgets.
     std::vector<Peer> peers;
     for (PeerId id = 1; id <= 6; ++id) {
-        peers.emplace_back(id, 500, 500, PeerProtocolId{static_cast<std::uint8_t>(id)});
+        peers.emplace_back(id, 1500, 1500, PeerProtocolId{static_cast<std::uint8_t>(id)});
         peers.back().joinSwarm(swarm);
         peers.back().joinSwarm(other);
     }
     peers[1].markHandshakeSent(swarm, 5); // Incomplete connection must not receive HAVE.
     Simulation simulation;
     Network network(simulation, peers,
-        {Link(2, 1, 800, .1), Link(2, 3, 800, .1), Link(2, 4, 800, .1),
-         Link(2, 5, 800, .1), Link(2, 6, 800, .1)}, {swarm, other});
+        {Link(2, 1, 500, .1), Link(2, 3, 500, .1), Link(2, 4, 500, .1),
+         Link(2, 5, 500, .1), Link(2, 6, 500, .1)}, {swarm, other});
     for (PeerId remote : {1u, 3u}) network.send(1, 2, remote, handshake(swarm, peers[1].protocolId()));
     network.send(2, 2, 4, handshake(other, peers[1].protocolId()));
     simulation.run();
@@ -1580,7 +2382,7 @@ struct SchedulingFixture {
     std::vector<Peer> joinedPeers() {
         std::vector<Peer> peers;
         for (PeerId id : {1u, 2u, 3u}) {
-            peers.emplace_back(id, 1000000, 1000000, PeerProtocolId{static_cast<std::uint8_t>(id)});
+            peers.emplace_back(id, 2000000, 2000000, PeerProtocolId{static_cast<std::uint8_t>(id)});
             for (const auto* current : {&swarm, &other}) peers.back().joinSwarm(*current, {static_cast<std::uint8_t>(id == 2 ? 0 : 0xc0)});
         }
         for (const auto* current : {&swarm, &other}) {
@@ -2010,6 +2812,34 @@ int main()
 {
     struct Test { const char* name; void (*run)(); };
     const Test tests[] = {
+        {"Explicit deterministic 6/4/4 Mbps sharing and release", equalShareExplicitSixFourFour},
+        {"Equal share upload", equalShareUpload},
+        {"Equal share upload release and progress", equalShareUploadRelease},
+        {"Equal share download", equalShareDownload},
+        {"Equal share both endpoint limits", equalShareEndpointLimits},
+        {"Equal share link cap avoids redundant scheduling", equalShareLinkCapUnchanged},
+        {"Equal share unrelated flow untouched", equalShareUnrelated},
+        {"Equal share FIFO membership", equalShareFifo},
+        {"Equal share full duplex", equalShareDuplex},
+        {"Equal share deterministic simultaneous starts", equalShareSameTimestamp},
+        {"Equal share aggregate invariants at transitions", equalShareAggregateTransitions},
+        {"Equal share old-rate progress before start", equalShareStartProgress},
+        {"Mbps slowdown progress and arrival", mbpsSlowdown},
+        {"Mbps speedup earlier completion", mbpsSpeedup},
+        {"Mbps multiple interval progress", mbpsMultipleChanges},
+        {"Mbps rate change at start timestamp", mbpsSameStartTime},
+        {"Mbps rate change one ULP before completion", mbpsNearCompletion},
+        {"Mbps every stale completion is a no-op", mbpsStaleSafety},
+        {"Mbps FIFO released once by final generation", mbpsFifo},
+        {"Mbps full-duplex independence", mbpsFullDuplex},
+        {"Mbps independent link unaffected", mbpsIndependentLink},
+        {"Mbps completion and arrival uniqueness", mbpsUniqueness},
+        {"Dynamic rate math, stale completion and FIFO", dynamicTransmissionRateMath},
+        {"Repeated transmission rate changes", repeatedTransmissionRateChanges},
+        {"Rate validation and exact completion boundary", transmissionRateValidationAndBoundary},
+        {"Active transmission lifecycle", activeTransmissionLifecycle},
+        {"Arrival scheduled only by valid completion", arrivalScheduledByCompletion},
+        {"Stale completion has no transport or protocol effects", staleCompletionNoOp},
         {"Piece completion reevaluates all swarm connections through FIFO", completionReevaluatesInterestAcrossConnections},
         {"Autonomous sequential pipeline, refill and short blocks", autonomousSequentialPipeline},
         {"Scheduler gates, duplicate reservations and unchoke resume", schedulerGatesReservationsAndResume},

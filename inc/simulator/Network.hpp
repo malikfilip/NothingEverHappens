@@ -2,6 +2,8 @@
 
 #include <vector>
 #include <optional>
+#include <map>
+#include <set>
 
 #include "simulator/Link.hpp"
 #include "simulator/Message.hpp"
@@ -13,6 +15,21 @@ namespace simulator {
     class Simulation;
     class TransmissionCompleteEvent;
     class TransmissionStartEvent;
+
+    using TransmissionId = std::uint64_t;
+
+    struct ActiveTransmission {
+        TransmissionId id;
+        SwarmId swarmId;
+        PeerId sender;
+        PeerId receiver;
+        Message message;
+        std::size_t linkIndex;
+        double remainingBits; // At lastRateUpdateTime.
+        double currentRate; // Bits per simulation second.
+        double lastRateUpdateTime;
+        std::uint64_t generation;
+    };
 
     class Network {
     public:
@@ -37,6 +54,17 @@ namespace simulator {
         // Read-only snapshot; throws std::invalid_argument for a missing link.
         TransmissionState transmissionState(PeerId sender, PeerId receiver) const;
 
+        // Explicit low-level rate override in bits per simulation second. Automatic sharing
+        // recomputes affected rates on active-set changes.
+        // Throws std::invalid_argument for an inactive ID, nonpositive/nonfinite rate,
+        // or nonfinite predicted completion/arrival time. Rejection leaves state unchanged.
+        void setTransmissionRate(TransmissionId id, double newRate);
+
+        // Queued messages have no active record.
+        const std::map<TransmissionId, ActiveTransmission>& activeTransmissions() const {
+            return active_transmissions_;
+        }
+
     private:
         friend class SendMessageEvent;
         friend class TransmissionCompleteEvent;
@@ -53,8 +81,21 @@ namespace simulator {
         void sendInitialBitfield(Peer& sender, SwarmId swarmId, PeerId receiver);
         std::size_t linkIndex(PeerId sender, PeerId receiver) const;
         void startTransmission(std::size_t linkIndex, PeerId sender);
-        void completeTransmission(std::size_t linkIndex, PeerId sender);
+        void completeTransmission(TransmissionId id, std::uint64_t generation);
 
+        std::set<TransmissionId> affectedTransmissions(PeerId sender, PeerId receiver) const;
+        void accountProgress(const std::set<TransmissionId>& ids);
+        double sharedRate(const ActiveTransmission& active) const;
+        void recomputeRates(const std::set<TransmissionId>& ids);
+
+        struct PeerTransport {
+            std::size_t peerIndex;
+            std::set<TransmissionId> outgoing;
+            std::set<TransmissionId> incoming;
+        };
+        std::map<PeerId, PeerTransport> peer_transport_;
+        std::map<TransmissionId, ActiveTransmission> active_transmissions_;
+        TransmissionId next_transmission_id_ = 1;
         Simulation& simulation_;
         std::vector<Peer> peers_;
         std::vector<Link> links_;
