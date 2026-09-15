@@ -38,4 +38,15 @@ if(BUILD_TESTING)
     )
     target_include_directories(message_delivery_tests PRIVATE inc)
     add_test(NAME message_delivery COMMAND message_delivery_tests)
+    add_executable(multi_peer_integration_tests
+        tests/MultiPeerIntegrationTests.cpp
+        src/Simulation.cpp
+        src/Peer.cpp
+        src/Link.cpp
+        src/Message.cpp
+        src/Swarm.cpp
+        src/Network.cpp
+    )
+    target_include_directories(multi_peer_integration_tests PRIVATE inc)
+    add_test(NAME multi_peer_integration COMMAND multi_peer_integration_tests)
 endif()
