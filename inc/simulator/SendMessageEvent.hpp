@@ -14,9 +14,10 @@ namespace simulator {
     class SendMessageEvent : public Event {
     public:
         // Requests enqueueing; this does not imply transmission has begun.
-        SendMessageEvent(double time, Network& network, SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
+        SendMessageEvent(double time, Network& network, SwarmId swarmId, PeerId sender, PeerId receiver, Message message,
+                         bool automaticRequest = false)
             : Event(time), network_(network), swarmId_(swarmId), sender_(sender), receiver_(receiver),
-              message_(std::move(message))
+              message_(std::move(message)), automaticRequest_(automaticRequest)
         {
         }
 
@@ -27,7 +28,8 @@ namespace simulator {
         }
         void execute() override
         {
-            network_.send(swarmId_, sender_, receiver_, std::move(message_));
+            if (automaticRequest_) network_.sendScheduledRequest(swarmId_, sender_, receiver_, std::move(message_));
+            else network_.send(swarmId_, sender_, receiver_, std::move(message_));
         }
 
     private:
@@ -36,6 +38,7 @@ namespace simulator {
         PeerId sender_;
         PeerId receiver_;
         Message message_;
+        bool automaticRequest_;
     };
 
 } // namespace simulator

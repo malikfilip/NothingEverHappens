@@ -158,6 +158,7 @@ void checkUnchanged(const PeerSwarmState& actual, const PeerSwarmState& before)
         check(connection.bitfieldSent == expected.bitfieldSent);
         check(connection.outgoingRequests == expected.outgoingRequests);
         check(connection.acceptedRequests == expected.acceptedRequests);
+        check(connection.scheduledRequests == expected.scheduledRequests);
         check(connection.weAreInterestedInRemote == expected.weAreInterestedInRemote);
         check(connection.handshakeComplete() == expected.handshakeComplete());
         check(connection.remoteIsChokingUs == expected.remoteIsChokingUs);
@@ -1050,18 +1051,30 @@ struct RequestFixture {
     RequestFixture(bool ownsFirst = true, bool ownsSecond = false)
         : network(simulation, joinedPeers(ownsFirst, ownsSecond), {Link(1, 2, 800, .1), Link(2, 3, 800, .1)},
                   {swarm, other}) {
-        for (const auto* current : {&swarm, &other}) {
-            for (PeerId remote : {1u, 3u}) {
-                network.send(current->id(), 2, remote, handshake(*current, b.protocolId()));
-            }
-        }
-        simulation.run();
         observeMessages(simulation, events);
     }
     std::vector<Peer> joinedPeers(bool ownsFirst, bool ownsSecond) {
         for (Peer* peer : {&a, &b, &c}) {
             peer->joinSwarm(swarm, {static_cast<std::uint8_t>(peer == &b ? 0x40 : (0x20 | (ownsFirst ? 0x80 : 0) | (ownsSecond ? 0x40 : 0)))});
             peer->joinSwarm(other, {static_cast<std::uint8_t>(peer == &b ? 0x40 : 0x80)});
+        }
+        // These tests explicitly control block traffic. Establish protocol state directly
+        // and leave availability unadvertised, so the automatic selector has no candidates.
+        for (const auto* current : {&swarm, &other}) {
+            for (Peer* remote : {&a, &c}) {
+                b.markHandshakeSent(*current, remote->id());
+                remote->markHandshakeSent(*current, b.id());
+                b.receiveMessage(*current, remote->id(), handshake(*current, remote->protocolId()), &remote->protocolId());
+                remote->receiveMessage(*current, b.id(), handshake(*current, b.protocolId()), &b.protocolId());
+                for (const auto pair : {std::pair{&b, remote}, std::pair{remote, &b}}) {
+                    auto& connection = const_cast<PeerSwarmState&>(pair.first->swarmState(current->id())).connections.at(pair.second->id());
+                    connection.bitfieldSent = true;
+                    connection.weAreInterestedInRemote = true;
+                    connection.remoteInterestedInUs = true;
+                    connection.remoteIsChokingUs = false;
+                    connection.weAreChokingRemote = false;
+                }
+            }
         }
         return {a, b, c};
     }
@@ -1284,6 +1297,8 @@ void sixteenBlocksAndShortFinalPiece()
     for (unsigned i = 0; i < 2; ++i) {
         f.network.send(1, 2, 1, Message(MessageType::Request, RequestPayload{2, i * 226, 226}));
     }
+    // Keep interest accurate while the manually requested final piece is still pending.
+    const_cast<PeerSwarmState&>(f.network.peer(2).swarmState(1)).connections.at(1).remoteBitfield[0] = 0x20;
     f.simulation.run();
     const auto& state = f.network.peer(2).swarmState(1);
     check(state.receivedBlocks.at(0) == std::vector<BlockRange>{{0, 1024}});
@@ -1407,7 +1422,7 @@ void completionHaveScopeFifoAndInterest()
     std::vector<Peer> peers;
     for (PeerId id = 1; id <= 6; ++id) {
         peers.emplace_back(id, 500, 500, PeerProtocolId{static_cast<std::uint8_t>(id)});
-        peers.back().joinSwarm(swarm, {static_cast<std::uint8_t>(id == 1 ? 0x40 : 0)});
+        peers.back().joinSwarm(swarm);
         peers.back().joinSwarm(other);
     }
     peers[1].markHandshakeSent(swarm, 5); // Incomplete connection must not receive HAVE.
@@ -1421,7 +1436,14 @@ void completionHaveScopeFifoAndInterest()
     std::vector<ExecutedMessage> events;
     observeMessages(simulation, events);
     const double start = simulation.currentTime();
-    network.send(1, 2, 1, Message(MessageType::Request, RequestPayload{1, 0, 4}));
+    auto& seed = const_cast<PeerSwarmState&>(network.peer(1).swarmState(1));
+    auto& downloader = const_cast<PeerSwarmState&>(network.peer(2).swarmState(1));
+    seed.localBitfield[0] = 0x40;
+    seed.connections.at(2).remoteInterestedInUs = true;
+    seed.connections.at(2).weAreChokingRemote = false;
+    downloader.connections.at(1).remoteBitfield[0] = 0x40;
+    downloader.connections.at(1).weAreInterestedInRemote = true;
+    network.deliver(1, 1, 2, Message(MessageType::Unchoke)); // Automatically requests the final piece.
     simulation.schedule(std::make_unique<CheckEvent>(start + .4, [&] {
         occupyDirection(network, 1, 2, 1); // HAVE must wait behind existing traffic.
     }));
@@ -1439,20 +1461,20 @@ void completionHaveScopeFifoAndInterest()
     std::vector<ExecutedMessage> toSeed;
     std::vector<PeerId> recipients;
     for (const auto& event : events) {
-        if (event.details.messageType == MessageType::Have) {
+        if (event.details.messageType == MessageType::Have && event.details.sender == 2) {
             check(event.details.sender == 2 && event.details.swarmId == 1);
             check(event.details.receiver == 1 || event.details.receiver == 3);
             if (event.kind == ExecutedKind::Request) recipients.push_back(event.details.receiver);
             if (event.details.receiver == 1) toSeed.push_back(event);
         }
-        if (event.details.messageType == MessageType::Request) check(event.details.sender == 2);
+        if (event.details.messageType == MessageType::Request) check(event.details.sender == 2 || event.details.sender == 3);
     }
     check(recipients == std::vector<PeerId>({1, 3}));
     checkEventTimes(toSeed, 2, MessageType::Have,
         start + .744, start + 2.576, start + 2.720, start + 2.820);
     check(network.peer(1).swarmState(1).connections.at(2).remoteBitfield[0] == 0x40);
-    check(network.peer(2).swarmState(1).connections.at(3).remoteInterestedInUs);
-    check(!network.peer(3).swarmState(1).connections.at(2).remoteIsChokingUs);
+    check(!network.peer(2).swarmState(1).connections.at(3).remoteInterestedInUs);
+    check(network.peer(3).swarmState(1).connections.at(2).remoteIsChokingUs);
     check(network.peer(3).swarmState(1).connections.at(2).outgoingRequests.empty());
     check(network.peer(4).swarmState(2).connections.at(2).remoteBitfield[0] == 0);
     check(network.peer(5).swarmState(1).connections.empty());
@@ -1480,13 +1502,287 @@ void completionHaveOnlyOnFirstCompletion()
             return event.kind == ExecutedKind::Request && event.details.messageType == MessageType::Have
                 && event.details.sender == 2 && event.details.receiver == remote && event.details.swarmId == 1;
         }) == 1);
-        check(f.incoming(1, remote).remoteBitfield[0] == 0xc0);
-        check(f.incoming(2, remote).remoteBitfield[0] == 0x40);
+        check(f.incoming(1, remote).remoteBitfield[0] == 0x80);
+        check(f.incoming(2, remote).remoteBitfield[0] == 0);
     }
     const auto eventCount = f.events.size();
     rejects([&] { f.network.deliver(1, 1, 2, Message(MessageType::Piece, PiecePayload{0, 512, 512})); });
     f.simulation.run();
     check(f.events.size() == eventCount);
+}
+
+void autonomousSequentialPipeline()
+{
+    constexpr std::uint32_t pieceLength = 4 * 16384 + 13;
+    const Swarm swarm(1, InfoHash{1}, 2 * pieceLength + 101, pieceLength);
+    Peer seed(1, 1000000, 1000000, PeerProtocolId{1}), leecher(2, 1000000, 1000000, PeerProtocolId{2});
+    seed.joinSwarm(swarm, {0xe0});
+    leecher.joinSwarm(swarm);
+    Simulation simulation;
+    Network network(simulation, {seed, leecher}, {Link(1, 2, 1000000, .01)}, {swarm});
+    std::vector<RequestPayload> started;
+    std::size_t maxPending = 0;
+    unsigned sends = 0, completes = 0, arrivals = 0, pieceArrivals = 0;
+    bool refilledBeforeSecondPieceArrival = false;
+    simulation.setEventObserver([&](const Event& event) {
+        const auto& connections = network.peer(2).swarmState(1).connections;
+        if (connections.contains(1)) {
+            const auto& connection = connections.at(1);
+            const auto pending = connection.outgoingRequests.size() + connection.scheduledRequests.size();
+            check(pending <= 5);
+            maxPending = std::max(maxPending, pending);
+        }
+        if (const auto* send = dynamic_cast<const SendMessageEvent*>(&event);
+            send && send->details().messageType == MessageType::Request) {
+            ++sends;
+            const auto& connection = connections.at(1);
+            check(connection.handshakeComplete() && connection.weAreInterestedInRemote && !connection.remoteIsChokingUs);
+            if (pieceArrivals == 1) refilledBeforeSecondPieceArrival = true;
+        }
+        if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+            start && start->details().messageType == MessageType::Request) {
+            started.push_back(std::get<RequestPayload>(start->message().payload()));
+        }
+        if (const auto* complete = dynamic_cast<const TransmissionCompleteEvent*>(&event);
+            complete && complete->details()->messageType == MessageType::Request) ++completes;
+        if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event)) {
+            if (arrival->details().messageType == MessageType::Request) ++arrivals;
+            if (arrival->details().messageType == MessageType::Piece) ++pieceArrivals;
+        }
+    });
+    network.send(1, 2, 1, handshake(swarm, leecher.protocolId()));
+    simulation.run();
+    std::vector<RequestPayload> expected;
+    for (std::uint32_t piece = 0; piece < 2; ++piece) {
+        for (std::uint32_t block = 0; block < 4; ++block) expected.push_back({piece, block * 16384, 16384});
+        expected.push_back({piece, 65536, 13});
+    }
+    expected.push_back({2, 0, 101});
+    check(started == expected);
+    check(maxPending == 5 && refilledBeforeSecondPieceArrival);
+    check(sends == 11 && completes == 11 && arrivals == 11 && pieceArrivals == 11);
+    const auto& state = network.peer(2).swarmState(1);
+    check(state.localBitfield == std::vector<std::uint8_t>{0xe0});
+    check(state.connections.at(1).scheduledRequests.empty() && state.connections.at(1).outgoingRequests.empty());
+    check(network.peer(1).swarmState(1).connections.at(2).acceptedRequests.empty());
+    check(network.peer(1).swarmState(1).connections.at(2).remoteBitfield == state.localBitfield);
+    check(!state.connections.at(1).weAreInterestedInRemote);
+    check(!network.peer(1).swarmState(1).connections.at(2).remoteInterestedInUs);
+}
+
+struct SchedulingFixture {
+    Swarm swarm{1, InfoHash{1}, 200000, 100000};
+    Swarm other{2, InfoHash{2}, 200000, 100000};
+    Simulation simulation;
+    Network network;
+    SchedulingFixture() : network(simulation, joinedPeers(),
+        {Link(1, 2, 1000000, .01), Link(2, 3, 1000000, .01)}, {swarm, other}) {}
+    std::vector<Peer> joinedPeers() {
+        std::vector<Peer> peers;
+        for (PeerId id : {1u, 2u, 3u}) {
+            peers.emplace_back(id, 1000000, 1000000, PeerProtocolId{static_cast<std::uint8_t>(id)});
+            for (const auto* current : {&swarm, &other}) peers.back().joinSwarm(*current, {static_cast<std::uint8_t>(id == 2 ? 0 : 0xc0)});
+        }
+        for (const auto* current : {&swarm, &other}) {
+            for (PeerId id : {1u, 3u}) {
+                auto& local = peers[1];
+                auto& remote = peers[id - 1];
+                local.markHandshakeSent(*current, id);
+                remote.markHandshakeSent(*current, 2);
+                local.receiveMessage(*current, id, handshake(*current, remote.protocolId()), &remote.protocolId());
+                remote.receiveMessage(*current, 2, handshake(*current, local.protocolId()), &local.protocolId());
+                auto& incoming = const_cast<PeerSwarmState&>(remote.swarmState(current->id())).connections.at(2);
+                incoming.remoteInterestedInUs = true;
+                incoming.weAreChokingRemote = false;
+                incoming.bitfieldSent = true;
+            }
+        }
+        return peers;
+    }
+    const PeerConnectionState& connection(SwarmId id = 1, PeerId remote = 1) const {
+        return network.peer(2).swarmState(id).connections.at(remote);
+    }
+};
+
+void completionReevaluatesInterestAcrossConnections()
+{
+    SchedulingFixture f;
+    auto& state = const_cast<PeerSwarmState&>(f.network.peer(2).swarmState(1));
+    // Peer 3 is useful only for piece 0; it stays choked, so peer 1 supplies the data.
+    state.connections.at(3).remoteBitfield[0] = 0x80;
+    state.connections.at(3).weAreInterestedInRemote = true;
+    auto& other = const_cast<PeerSwarmState&>(f.network.peer(2).swarmState(2));
+    other.connections.at(1).remoteBitfield[0] = 0xc0;
+    other.connections.at(1).weAreInterestedInRemote = true;
+    const auto otherBefore = other;
+    std::vector<ExecutedMessage> events;
+    unsigned notInterestedToOne = 0, notInterestedToThree = 0;
+    f.simulation.setEventObserver([&](const Event& event) {
+        if (const auto* send = dynamic_cast<const SendMessageEvent*>(&event);
+            send && send->details().messageType == MessageType::NotInterested) {
+            const auto details = send->details();
+            check(details.sender == 2 && details.swarmId == 1);
+            check(!f.connection(1, details.receiver).weAreInterestedInRemote);
+            // Remote state changes only after the FIFO transmission and propagation.
+            check(f.network.peer(details.receiver).swarmState(1).connections.at(2).remoteInterestedInUs);
+            if (details.receiver == 3) {
+                ++notInterestedToThree;
+                check(state.localBitfield[0] == 0x80);
+                check(f.connection().weAreInterestedInRemote); // Peer 1 still offers piece 1.
+            } else {
+                check(details.receiver == 1);
+                ++notInterestedToOne;
+                check(state.localBitfield[0] == 0xc0);
+            }
+            events.push_back({ExecutedKind::Request, event.time(), details});
+        }
+        if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+            start && start->details().messageType == MessageType::NotInterested) {
+            events.push_back({ExecutedKind::Start, event.time(), start->details()});
+        }
+        if (const auto* complete = dynamic_cast<const TransmissionCompleteEvent*>(&event);
+            complete && complete->details()->messageType == MessageType::NotInterested) {
+            events.push_back({ExecutedKind::Complete, event.time(), *complete->details()});
+        }
+        if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event);
+            arrival && arrival->details().messageType == MessageType::NotInterested) {
+            events.push_back({ExecutedKind::Arrival, event.time(), arrival->details()});
+            check(f.network.peer(arrival->details().receiver).swarmState(1).connections.at(2).remoteInterestedInUs);
+        }
+    });
+    f.network.deliver(1, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0xc0}}));
+    f.network.deliver(1, 1, 2, Message(MessageType::Unchoke));
+    f.simulation.run();
+    check(notInterestedToOne == 1 && notInterestedToThree == 1);
+    for (PeerId remote : {1u, 3u}) {
+        std::vector<ExecutedMessage> flow;
+        for (const auto& event : events) if (event.details.receiver == remote) flow.push_back(event);
+        check(flow.size() == 4);
+        check(flow[0].kind == ExecutedKind::Request && flow[1].kind == ExecutedKind::Start);
+        check(flow[2].kind == ExecutedKind::Complete && flow[3].kind == ExecutedKind::Arrival);
+        check(flow[1].time > flow[0].time); // The completion HAVE is ahead in this direction's FIFO.
+        check(std::abs(flow[2].time - flow[1].time - 5 * 8.0 / 1000000) < 1e-12);
+        check(std::abs(flow[3].time - flow[2].time - .01) < 1e-12);
+        check(!f.connection(1, remote).weAreInterestedInRemote);
+        check(!f.network.peer(remote).swarmState(1).connections.at(2).remoteInterestedInUs);
+    }
+    checkUnchanged(other, otherBefore);
+    // Repeated availability for already-owned pieces must not repeat NOT_INTERESTED.
+    f.network.deliver(1, 1, 2, Message(MessageType::Have, HavePayload{1}));
+    f.network.deliver(1, 3, 2, Message(MessageType::Have, HavePayload{0}));
+    f.simulation.run();
+    check(notInterestedToOne == 1 && notInterestedToThree == 1);
+}
+
+void schedulerGatesReservationsAndResume()
+{
+    SchedulingFixture f;
+    std::vector<ExecutedMessage> events;
+    observeMessages(f.simulation, events);
+    f.network.deliver(1, 1, 2, Message(MessageType::Unchoke)); // No advertised pieces / interest.
+    check(f.connection().scheduledRequests.empty());
+    f.network.deliver(1, 1, 2, Message(MessageType::Choke));
+    f.network.deliver(1, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0xc0}}));
+    check(f.connection().weAreInterestedInRemote && f.connection().scheduledRequests.empty());
+    f.network.deliver(1, 1, 2, Message(MessageType::Unchoke));
+    check(f.connection().scheduledRequests.size() == 5 && f.connection().outgoingRequests.empty());
+    for (int i = 0; i < 3; ++i) {
+        f.network.deliver(1, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0xc0}}));
+        f.network.deliver(1, 1, 2, Message(MessageType::Have, HavePayload{0}));
+        f.network.deliver(1, 1, 2, Message(MessageType::Unchoke));
+    }
+    check(f.connection().scheduledRequests.size() == 5);
+    // Choke arrives before the reserved send events execute; reservations must be released.
+    f.network.deliver(1, 1, 2, Message(MessageType::Choke));
+    f.simulation.run();
+    check(f.connection().scheduledRequests.empty() && f.connection().outgoingRequests.empty());
+    check(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.kind == ExecutedKind::Start && event.details.messageType == MessageType::Request;
+    }));
+    f.network.deliver(1, 1, 2, Message(MessageType::Unchoke));
+    check(f.connection().scheduledRequests.size() == 5);
+    f.simulation.run();
+    check(f.network.peer(2).swarmState(1).localBitfield[0] == 0xc0);
+    check(f.connection().scheduledRequests.empty() && f.connection().outgoingRequests.empty());
+    check(f.network.peer(2).swarmState(2).localBitfield[0] == 0);
+}
+
+void schedulerSkipsReceivedAndOutstandingAcrossPeers()
+{
+    SchedulingFixture f;
+    auto& state = const_cast<PeerSwarmState&>(f.network.peer(2).swarmState(1));
+    state.receivedBlocks[0] = {{0, 1024}, {2048, 4096}};
+    state.connections.at(3).weAreInterestedInRemote = true;
+    state.connections.at(3).remoteIsChokingUs = false;
+    const RequestPayload explicitBlock{0, 8192, 1024};
+    f.network.send(1, 2, 3, Message(MessageType::Request, explicitBlock));
+    f.network.deliver(1, 1, 2, Message(MessageType::Unchoke));
+    f.network.deliver(1, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0xc0}}));
+    const auto& reserved = f.connection().scheduledRequests;
+    check(reserved.size() == 5);
+    check(reserved[0] == RequestPayload{0, 1024, 1024});
+    check(reserved[1] == RequestPayload{0, 4096, 4096});
+    check(reserved[2] == RequestPayload{0, 9216, 16384});
+    f.network.deliver(1, 3, 2, Message(MessageType::Bitfield, BitfieldPayload{{0xc0}}));
+    check(f.connection(1, 3).scheduledRequests.size() == 4); // One manual request already consumes capacity.
+    f.network.deliver(2, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0xc0}}));
+    f.network.deliver(2, 1, 2, Message(MessageType::Unchoke));
+    check(f.connection(2).scheduledRequests.front() == RequestPayload{0, 0, 16384});
+    std::vector<RequestPayload> requested{explicitBlock};
+    f.simulation.setEventObserver([&](const Event& event) {
+        const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+        if (!start || start->details().messageType != MessageType::Request || start->details().sender != 2) return;
+        const auto& block = std::get<RequestPayload>(start->message().payload());
+        if (start->details().swarmId != 1) return;
+        for (const auto& earlier : requested) {
+            if (earlier.index == block.index) check(block.begin >= earlier.begin + earlier.length || earlier.begin >= block.begin + block.length);
+        }
+        if (block.index == 0) {
+            check(block.begin >= 1024);
+            check(block.begin >= 4096 || block.begin + block.length <= 2048);
+        }
+        requested.push_back(block);
+        for (const auto& [remote, connection] : f.network.peer(2).swarmState(1).connections) {
+            check(connection.outgoingRequests.size() + connection.scheduledRequests.size() <= 5);
+        }
+    });
+    f.simulation.run();
+    for (SwarmId id : {1u, 2u}) {
+        const auto& complete = f.network.peer(2).swarmState(id);
+        check(complete.localBitfield[0] == 0xc0);
+        for (PeerId remote : {1u, 3u}) {
+            check(complete.connections.at(remote).outgoingRequests.empty());
+            check(complete.connections.at(remote).scheduledRequests.empty());
+        }
+    }
+}
+
+void schedulerReplansWithdrawnAvailability()
+{
+    SchedulingFixture f;
+    f.network.deliver(1, 1, 2, Message(MessageType::Unchoke));
+    f.network.deliver(1, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0xc0}}));
+    check(f.connection().scheduledRequests.size() == 5);
+    // Withdraw piece 0 before send events execute; piece 1 must still download.
+    f.network.deliver(1, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0x40}}));
+    std::vector<RequestPayload> requests;
+    f.simulation.setEventObserver([&](const Event& event) {
+        if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+            start && start->details().messageType == MessageType::Request) {
+            requests.push_back(std::get<RequestPayload>(start->message().payload()));
+        }
+    });
+    f.simulation.run();
+    check(requests.size() == 7);
+    check(std::all_of(requests.begin(), requests.end(), [](const auto& block) { return block.index == 1; }));
+    check(f.network.peer(2).swarmState(1).localBitfield[0] == 0x40);
+    // Finishing the advertised piece sent NOT_INTERESTED and caused CHOKE.
+    // New availability must restore interest, then wait for UNCHOKE before requesting.
+    check(!f.connection().weAreInterestedInRemote && f.connection().remoteIsChokingUs);
+    f.network.deliver(1, 1, 2, Message(MessageType::Have, HavePayload{0}));
+    check(f.connection().weAreInterestedInRemote && f.connection().scheduledRequests.empty());
+    f.simulation.run();
+    check(f.network.peer(2).swarmState(1).localBitfield[0] == 0xc0);
 }
 
 void twoWayHandshakeLifecycle()
@@ -1714,6 +2010,11 @@ int main()
 {
     struct Test { const char* name; void (*run)(); };
     const Test tests[] = {
+        {"Piece completion reevaluates all swarm connections through FIFO", completionReevaluatesInterestAcrossConnections},
+        {"Autonomous sequential pipeline, refill and short blocks", autonomousSequentialPipeline},
+        {"Scheduler gates, duplicate reservations and unchoke resume", schedulerGatesReservationsAndResume},
+        {"Scheduler excludes received/outstanding ranges across peers and swarms", schedulerSkipsReceivedAndOutstandingAcrossPeers},
+        {"Scheduler replans withdrawn availability and resumes on HAVE", schedulerReplansWithdrawnAvailability},
         {"Completion HAVE scope, FIFO and receive-side interest", completionHaveScopeFifoAndInterest},
         {"Completion HAVE only on first full coverage", completionHaveOnlyOnFirstCompletion},
         {"PIECE requires established sender context", pieceRequiresEstablishedSenderContext},

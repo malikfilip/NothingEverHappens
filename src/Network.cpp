@@ -15,6 +15,11 @@
 
 namespace simulator {
 
+    namespace {
+        constexpr std::uint32_t requestBlockSize = 16 * 1024;
+        constexpr std::size_t requestPipelineDepth = 5;
+    }
+
     Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms)
         : simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
     {
@@ -106,6 +111,14 @@ namespace simulator {
                     simulation_.schedule(std::make_unique<SendMessageEvent>(
                         simulation_.currentTime(), *this, swarmId, receiver, remote,
                         Message(MessageType::Have, HavePayload{piece.index})));
+                    auto& connection = to->swarm_states_.at(swarmId).connections.at(remote);
+                    const bool interested = Peer::hasUsefulPieces(currentSwarm, state, connection);
+                    if (interested != connection.weAreInterestedInRemote) {
+                        connection.weAreInterestedInRemote = interested;
+                        simulation_.schedule(std::make_unique<SendMessageEvent>(
+                            simulation_.currentTime(), *this, swarmId, receiver, remote,
+                            Message(interested ? MessageType::Interested : MessageType::NotInterested)));
+                    }
                 }
             }
         }
@@ -144,6 +157,105 @@ namespace simulator {
         if (message.type() == MessageType::Handshake) {
             sendInitialBitfield(*to, swarmId, sender);
         }
+        if (availability || message.type() == MessageType::Unchoke
+            || message.type() == MessageType::Piece || message.type() == MessageType::Handshake) {
+            tryScheduleRequests(*to, swarmId, sender);
+        }
+    }
+
+    std::optional<RequestPayload> Network::nextRequestBlock(const Swarm& swarm,
+        const PeerSwarmState& state, std::uint32_t piece, std::uint32_t begin)
+    {
+        const auto size = swarm.pieceSize(piece);
+        std::vector<BlockRange> occupied;
+        if (const auto received = state.receivedBlocks.find(piece); received != state.receivedBlocks.end()) {
+            occupied = received->second;
+        }
+        // Reservations and in-flight blocks on every remote exclude overlapping requests.
+        for (const auto& [remote, connection] : state.connections) {
+            for (const auto* requests : {&connection.outgoingRequests, &connection.scheduledRequests}) {
+                for (const auto& request : *requests) {
+                    if (request.index == piece) occupied.push_back({request.begin, request.begin + request.length});
+                }
+            }
+        }
+        std::sort(occupied.begin(), occupied.end(), [](const auto& a, const auto& b) {
+            return a.begin < b.begin;
+        });
+        for (const auto& range : occupied) {
+            if (range.end <= begin) continue;
+            if (range.begin > begin) {
+                return RequestPayload{piece, begin, std::min(requestBlockSize, range.begin - begin)};
+            }
+            begin = range.end;
+        }
+        if (begin >= size) return std::nullopt;
+        return RequestPayload{piece, begin, std::min(requestBlockSize, size - begin)};
+    }
+
+    std::optional<std::uint32_t> Network::selectPiece(const Swarm& swarm,
+        const PeerSwarmState& state, const PeerConnectionState& connection,
+        const PeerSwarmState& remoteState)
+    {
+        // Sequential: only this helper defines the piece-selection strategy.
+        for (std::uint32_t piece = 0; piece < swarm.pieceCount(); ++piece) {
+            const auto mask = 0x80u >> (piece % 8);
+            if ((state.localBitfield[piece / 8] & mask) == 0
+                && (connection.remoteBitfield[piece / 8] & mask) != 0
+                && (remoteState.localBitfield[piece / 8] & mask) != 0
+                && nextRequestBlock(swarm, state, piece)) return piece;
+        }
+        return std::nullopt;
+    }
+
+    void Network::tryScheduleRequests(Peer& requester, SwarmId swarmId, PeerId remotePeerId)
+    {
+        const auto& currentSwarm = swarm(swarmId);
+        if (currentSwarm.pieceLength() == 0 || !requester.hasSwarm(swarmId)) return;
+        const auto& remote = peer(remotePeerId);
+        if (!remote.hasSwarm(swarmId)) return;
+        auto& state = requester.swarm_states_.at(swarmId);
+        const auto found = state.connections.find(remotePeerId);
+        if (found == state.connections.end()) return;
+        auto& connection = found->second;
+        if (!connection.handshakeComplete() || !connection.weAreInterestedInRemote
+            || connection.remoteIsChokingUs) return;
+        while (connection.outgoingRequests.size() + connection.scheduledRequests.size() < requestPipelineDepth) {
+            const auto piece = selectPiece(currentSwarm, state, connection, remote.swarmState(swarmId));
+            if (!piece) break;
+            const auto block = *nextRequestBlock(currentSwarm, state, *piece);
+            connection.scheduledRequests.push_back(block);
+            simulation_.schedule(std::make_unique<SendMessageEvent>(
+                simulation_.currentTime(), *this, swarmId, requester.id(), remotePeerId,
+                Message(MessageType::Request, block), true));
+        }
+    }
+
+    void Network::sendScheduledRequest(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
+    {
+        const auto from = std::find_if(peers_.begin(), peers_.end(),
+            [sender](const Peer& candidate) { return candidate.id() == sender; });
+        const auto& block = std::get<RequestPayload>(message.payload());
+        auto& state = from->swarm_states_.at(swarmId);
+        auto& connection = state.connections.at(receiver);
+        if (std::erase(connection.scheduledRequests, block) == 0) return;
+        // Notifications at the same timestamp may have changed eligibility or coverage.
+        try {
+            from->validateRequestTo(swarm(swarmId), peer(receiver), block);
+        } catch (const std::invalid_argument&) {
+            tryScheduleRequests(*from, swarmId, receiver);
+            return;
+        }
+        if ((connection.remoteBitfield[block.index / 8] & (0x80u >> (block.index % 8))) == 0
+            || connection.outgoingRequests.size() >= requestPipelineDepth) {
+            tryScheduleRequests(*from, swarmId, receiver);
+            return;
+        }
+        if (nextRequestBlock(swarm(swarmId), state, block.index, block.begin) != block) {
+            tryScheduleRequests(*from, swarmId, receiver);
+            return;
+        }
+        send(swarmId, sender, receiver, std::move(message));
     }
 
     void Network::sendInitialBitfield(Peer& sender, SwarmId swarmId, PeerId receiver)

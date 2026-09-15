@@ -10,7 +10,7 @@ int main()
     const simulator::Swarm swarm(1, simulator::InfoHash{1}, 8 * 16384 + 4096, 16384);
     simulator::Peer sender(1, 1000.0, 2000.0, simulator::PeerProtocolId{0xa1});
     simulator::Peer receiver(2, 2000.0, 500.0, simulator::PeerProtocolId{0xb2});
-    sender.joinSwarm(swarm, {0x80, 0}); // Peer 1 initially owns piece 0.
+    sender.joinSwarm(swarm, {0xff, 0x80}); // Peer 1 seeds all nine pieces.
     receiver.joinSwarm(swarm);
 
     simulator::Simulation simulation(true);
@@ -20,12 +20,6 @@ int main()
         0.0, network, swarm.id(), 1, 2,
         simulator::Message(simulator::MessageType::Handshake,
             simulator::HandshakePayload{swarm.infoHash(), sender.protocolId()})));
-    simulation.run();
-
-    // One explicit request after UNCHOKE; no automatic block scheduling.
-    simulation.schedule(std::make_unique<simulator::SendMessageEvent>(
-        simulation.currentTime(), network, swarm.id(), 2, 1,
-        simulator::Message(simulator::MessageType::Request, simulator::RequestPayload{0, 0, 1024})));
     simulation.run();
 
     const auto& a = network.peer(1).swarmState(swarm.id());
@@ -54,6 +48,9 @@ int main()
     std::cout << "Peer 2 received piece 0 range: [" << blocks.front().begin << ", "
               << blocks.front().end << ") bytes\n"
               << "Peer 2 pending requests: " << bToA.outgoingRequests.size() << '\n';
-    return bToA.outgoingRequests.empty() && blocks.front().end == 1024 && aToB.acceptedRequests.empty() && complete && exchanged && bToA.weAreInterestedInRemote && aToB.remoteInterestedInUs
-        && !aToB.weAreChokingRemote && !bToA.remoteIsChokingUs ? 0 : 1;
+    const bool downloaded = b.localBitfield == a.localBitfield;
+    std::cout << "All pieces downloaded: " << downloaded << '\n';
+    return downloaded && complete && exchanged && blocks.front().end == swarm.pieceSize(0)
+        && bToA.scheduledRequests.empty() && bToA.outgoingRequests.empty()
+        && aToB.acceptedRequests.empty() ? 0 : 1;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <optional>
 
 #include "simulator/Link.hpp"
 #include "simulator/Message.hpp"
@@ -37,8 +38,17 @@ namespace simulator {
         TransmissionState transmissionState(PeerId sender, PeerId receiver) const;
 
     private:
+        friend class SendMessageEvent;
         friend class TransmissionCompleteEvent;
         friend class TransmissionStartEvent;
+        // Network owns multiple peers, so the local requester is explicit.
+        void tryScheduleRequests(Peer& requester, SwarmId swarmId, PeerId remotePeerId);
+        void sendScheduledRequest(SwarmId swarmId, PeerId sender, PeerId receiver, Message message);
+        static std::optional<RequestPayload> nextRequestBlock(const Swarm& swarm,
+            const PeerSwarmState& state, std::uint32_t piece, std::uint32_t begin = 0);
+        static std::optional<std::uint32_t> selectPiece(const Swarm& swarm,
+            const PeerSwarmState& state, const PeerConnectionState& connection,
+            const PeerSwarmState& remoteState);
         void beginTransmission(QueuedTransmission transmission);
         void sendInitialBitfield(Peer& sender, SwarmId swarmId, PeerId receiver);
         std::size_t linkIndex(PeerId sender, PeerId receiver) const;

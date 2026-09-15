@@ -28,6 +28,8 @@ namespace simulator {
         // Outgoing requests remain pending until a matching PIECE arrives.
         std::vector<RequestPayload> outgoingRequests;
         std::vector<RequestPayload> acceptedRequests;
+        // Reserved by automatic scheduling until the SendMessageEvent executes.
+        std::vector<RequestPayload> scheduledRequests;
 
         bool handshakeComplete() const { return handshakeSent && handshakeReceived; }
     };
