@@ -65,8 +65,27 @@ namespace simulator {
                 wasChoking = connection->second.weAreChokingRemote;
             }
         }
+        std::size_t acceptedBefore = 0;
+        if (message.type() == MessageType::Request && to->hasSwarm(swarmId)) {
+            const auto& connections = to->swarmState(swarmId).connections;
+            if (connections.contains(sender)) acceptedBefore = connections.at(sender).acceptedRequests.size();
+        }
         to->receiveMessage(currentSwarm, sender, message, senderProtocolId,
-            message.type() == MessageType::Request ? &peer(sender) : nullptr);
+            (message.type() == MessageType::Request || message.type() == MessageType::Piece) ? &peer(sender) : nullptr);
+        if (message.type() == MessageType::Request
+            && to->swarmState(swarmId).connections.at(sender).acceptedRequests.size() != acceptedBefore) {
+            const auto& request = std::get<RequestPayload>(message.payload());
+            simulation_.schedule(std::make_unique<SendMessageEvent>(
+                simulation_.currentTime(), *this, swarmId, receiver, sender,
+                Message(MessageType::Piece, PiecePayload{request.index, request.begin, request.length})));
+        }
+        if (message.type() == MessageType::Piece) {
+            const auto& piece = std::get<PiecePayload>(message.payload());
+            const auto from = std::find_if(peers_.begin(), peers_.end(),
+                [sender](const Peer& candidate) { return candidate.id() == sender; });
+            std::erase(from->swarm_states_.at(swarmId).connections.at(receiver).acceptedRequests,
+                RequestPayload{piece.index, piece.begin, piece.length});
+        }
         if (interestMessage) {
             const bool choking = to->swarmState(swarmId).connections.at(sender).weAreChokingRemote;
             if (choking != wasChoking) {
@@ -153,6 +172,9 @@ namespace simulator {
             const auto& pending = from.swarmState(swarmId).connections.at(receiver).outgoingRequests;
             if (std::find(pending.begin(), pending.end(), request) != pending.end()) return;
         }
+        if (message.type() == MessageType::Piece) {
+            from.validatePieceTo(swarm(swarmId), to, std::get<PiecePayload>(message.payload()));
+        }
         const auto request = message.type() == MessageType::Request
             ? std::optional<RequestPayload>(std::get<RequestPayload>(message.payload())) : std::nullopt;
         auto& link = links_[index];
@@ -194,6 +216,10 @@ namespace simulator {
         const auto& to = peer(transmission.receiver);
         const auto from = std::find_if(peers_.begin(), peers_.end(),
             [sender](const Peer& candidate) { return candidate.id() == sender; });
+        if (transmission.message.type() == MessageType::Piece) {
+            from->validatePieceTo(swarm(transmission.swarmId), to,
+                std::get<PiecePayload>(transmission.message.payload()));
+        }
         for (double bandwidth : {from->uploadCapacity(), to.downloadCapacity(), link.bandwidth()}) {
             if (!std::isfinite(bandwidth) || bandwidth <= 0.0) {
                 throw std::invalid_argument("Transfer bandwidth must be finite and positive");

@@ -67,6 +67,39 @@ namespace simulator {
         }
         return false;
     }
+    void Peer::validateBlock(const Swarm& swarm, const RequestPayload& block)
+    {
+        const auto size = swarm.pieceSize(block.index);
+        if (block.length == 0 || block.begin >= size || block.length > size - block.begin) {
+            throw std::invalid_argument("Block is outside the piece");
+        }
+    }
+
+    void Peer::validatePieceTo(const Swarm& swarm, const Peer& remote, const PiecePayload& piece) const
+    {
+        const RequestPayload block{piece.index, piece.begin, piece.length};
+        validateBlock(swarm, block);
+        if (!hasSwarm(swarm.id()) || !remote.hasSwarm(swarm.id())) {
+            throw std::invalid_argument("PIECE peers must share the swarm");
+        }
+        const auto& state = swarmState(swarm.id());
+        const auto connection = state.connections.find(remote.id());
+        const auto& remoteConnections = remote.swarmState(swarm.id()).connections;
+        const auto requester = remoteConnections.find(id());
+        if (connection == state.connections.end() || requester == remoteConnections.end()
+            || !connection->second.handshakeComplete() || !requester->second.handshakeComplete()
+            || connection->second.weAreChokingRemote
+            || (state.localBitfield[piece.index / 8] & (0x80u >> (piece.index % 8))) == 0) {
+            throw std::invalid_argument("PIECE requires ownership and an unchoked connection");
+        }
+        const auto& accepted = connection->second.acceptedRequests;
+        const auto& outgoing = requester->second.outgoingRequests;
+        if (std::find(accepted.begin(), accepted.end(), block) == accepted.end()
+            || std::find(outgoing.begin(), outgoing.end(), block) == outgoing.end()) {
+            throw std::invalid_argument("PIECE must answer an accepted outstanding request");
+        }
+    }
+
     void Peer::validateRequestTo(const Swarm& swarm, const Peer& remote, const RequestPayload& request) const
     {
         if (!hasSwarm(swarm.id()) || !remote.hasSwarm(swarm.id())) {
@@ -78,10 +111,7 @@ namespace simulator {
             || !connection->second.weAreInterestedInRemote || connection->second.remoteIsChokingUs) {
             throw std::invalid_argument("REQUEST requires handshake, interest and an unchoked connection");
         }
-        const auto size = swarm.pieceSize(request.index);
-        if (request.length == 0 || request.begin >= size || request.length > size - request.begin) {
-            throw std::invalid_argument("REQUEST block is outside the piece");
-        }
+        validateBlock(swarm, request);
         const auto mask = 0x80u >> (request.index % 8);
         if ((state.localBitfield[request.index / 8] & mask) != 0
             || (remote.swarmState(swarm.id()).localBitfield[request.index / 8] & mask) == 0) {
@@ -152,6 +182,26 @@ namespace simulator {
             }
         }
 
+        if (message.type() == MessageType::Piece) {
+            const auto& piece = std::get<PiecePayload>(message.payload());
+            const RequestPayload block{piece.index, piece.begin, piece.length};
+            validateBlock(swarm, block);
+            const auto connection = state->second.connections.find(sender);
+            if (!senderPeer || senderPeer->id() != sender || !senderPeer->hasSwarm(swarm.id())
+                || connection == state->second.connections.end() || !connection->second.handshakeComplete()) {
+                throw std::invalid_argument("PIECE requires an established sender in this swarm");
+            }
+            const auto& senderConnections = senderPeer->swarmState(swarm.id()).connections;
+            const auto senderConnection = senderConnections.find(id());
+            if (senderConnection == senderConnections.end() || !senderConnection->second.handshakeComplete()) {
+                throw std::invalid_argument("PIECE requires an established sender connection");
+            }
+            const auto& pending = connection->second.outgoingRequests;
+            if (std::find(pending.begin(), pending.end(), block) == pending.end()) {
+                throw std::invalid_argument("Unsolicited or mismatched PIECE");
+            }
+        }
+
         auto& connections = state->second.connections;
         auto connection = connections.find(sender);
         if (connection == connections.end()) {
@@ -193,7 +243,28 @@ namespace simulator {
             }
             break;
         }
-        case MessageType::Piece:
+        case MessageType::Piece: {
+            const auto& piece = std::get<PiecePayload>(message.payload());
+            const RequestPayload block{piece.index, piece.begin, piece.length};
+            auto& ranges = state->second.receivedBlocks[piece.index];
+            ranges.push_back({piece.begin, piece.begin + piece.length});
+            std::sort(ranges.begin(), ranges.end(), [](const BlockRange& a, const BlockRange& b) {
+                return a.begin < b.begin;
+            });
+            std::vector<BlockRange> merged;
+            for (const auto& range : ranges) {
+                if (merged.empty() || merged.back().end < range.begin) merged.push_back(range);
+                else merged.back().end = std::max(merged.back().end, range.end);
+            }
+            ranges = std::move(merged);
+            if (ranges.size() == 1 && ranges.front().begin == 0
+                && ranges.front().end == swarm.pieceSize(piece.index)) {
+                state->second.localBitfield[piece.index / 8] |=
+                    static_cast<std::uint8_t>(0x80u >> (piece.index % 8));
+            }
+            std::erase(remote.outgoingRequests, block);
+            break;
+        }
         case MessageType::Cancel:
             // Protocol handling is not implemented yet.
             break;

@@ -49,7 +49,11 @@ int main()
               << "Peer 1 received peer 2 interest: " << aToB.remoteInterestedInUs << '\n';
     std::cout << "Peer 1 is choking peer 2: " << aToB.weAreChokingRemote << '\n'
               << "Peer 2 sees peer 1 choking it: " << bToA.remoteIsChokingUs << '\n';
-    std::cout << "Peer 1 accepted requests from peer 2: " << aToB.acceptedRequests.size() << '\n';
-    return aToB.acceptedRequests.size() == 1 && complete && exchanged && bToA.weAreInterestedInRemote && aToB.remoteInterestedInUs
+    std::cout << "Peer 1 requests awaiting response: " << aToB.acceptedRequests.size() << '\n';
+    const auto& blocks = b.receivedBlocks.at(0);
+    std::cout << "Peer 2 received piece 0 range: [" << blocks.front().begin << ", "
+              << blocks.front().end << ") bytes\n"
+              << "Peer 2 pending requests: " << bToA.outgoingRequests.size() << '\n';
+    return bToA.outgoingRequests.empty() && blocks.front().end == 1024 && aToB.acceptedRequests.empty() && complete && exchanged && bToA.weAreInterestedInRemote && aToB.remoteInterestedInUs
         && !aToB.weAreChokingRemote && !bToA.remoteIsChokingUs ? 0 : 1;
 }
