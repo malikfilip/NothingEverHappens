@@ -1400,6 +1400,95 @@ void queuedPieceRevalidatesOutstandingRequest()
     }));
 }
 
+void completionHaveScopeFifoAndInterest()
+{
+    const Swarm swarm(1, InfoHash{1}, 20, 16); // Four-byte final piece.
+    const Swarm other(2, InfoHash{2}, 20, 16);
+    std::vector<Peer> peers;
+    for (PeerId id = 1; id <= 6; ++id) {
+        peers.emplace_back(id, 500, 500, PeerProtocolId{static_cast<std::uint8_t>(id)});
+        peers.back().joinSwarm(swarm, {static_cast<std::uint8_t>(id == 1 ? 0x40 : 0)});
+        peers.back().joinSwarm(other);
+    }
+    peers[1].markHandshakeSent(swarm, 5); // Incomplete connection must not receive HAVE.
+    Simulation simulation;
+    Network network(simulation, peers,
+        {Link(2, 1, 800, .1), Link(2, 3, 800, .1), Link(2, 4, 800, .1),
+         Link(2, 5, 800, .1), Link(2, 6, 800, .1)}, {swarm, other});
+    for (PeerId remote : {1u, 3u}) network.send(1, 2, remote, handshake(swarm, peers[1].protocolId()));
+    network.send(2, 2, 4, handshake(other, peers[1].protocolId()));
+    simulation.run();
+    std::vector<ExecutedMessage> events;
+    observeMessages(simulation, events);
+    const double start = simulation.currentTime();
+    network.send(1, 2, 1, Message(MessageType::Request, RequestPayload{1, 0, 4}));
+    simulation.schedule(std::make_unique<CheckEvent>(start + .4, [&] {
+        occupyDirection(network, 1, 2, 1); // HAVE must wait behind existing traffic.
+    }));
+    simulation.schedule(std::make_unique<CheckEvent>(start + .745, [&] {
+        check(network.peer(2).swarmState(1).localBitfield[0] == 0x40);
+        check(network.peer(1).swarmState(1).connections.at(2).remoteBitfield[0] == 0);
+        check(network.peer(3).swarmState(1).connections.at(2).remoteBitfield[0] == 0);
+    }));
+    simulation.schedule(std::make_unique<CheckEvent>(start + .989, [&] {
+        const auto& observer = network.peer(3).swarmState(1).connections.at(2);
+        check(observer.remoteBitfield[0] == 0x40 && observer.weAreInterestedInRemote);
+        check(network.peer(1).swarmState(1).connections.at(2).remoteBitfield[0] == 0);
+    }));
+    simulation.run();
+    std::vector<ExecutedMessage> toSeed;
+    std::vector<PeerId> recipients;
+    for (const auto& event : events) {
+        if (event.details.messageType == MessageType::Have) {
+            check(event.details.sender == 2 && event.details.swarmId == 1);
+            check(event.details.receiver == 1 || event.details.receiver == 3);
+            if (event.kind == ExecutedKind::Request) recipients.push_back(event.details.receiver);
+            if (event.details.receiver == 1) toSeed.push_back(event);
+        }
+        if (event.details.messageType == MessageType::Request) check(event.details.sender == 2);
+    }
+    check(recipients == std::vector<PeerId>({1, 3}));
+    checkEventTimes(toSeed, 2, MessageType::Have,
+        start + .744, start + 2.576, start + 2.720, start + 2.820);
+    check(network.peer(1).swarmState(1).connections.at(2).remoteBitfield[0] == 0x40);
+    check(network.peer(2).swarmState(1).connections.at(3).remoteInterestedInUs);
+    check(!network.peer(3).swarmState(1).connections.at(2).remoteIsChokingUs);
+    check(network.peer(3).swarmState(1).connections.at(2).outgoingRequests.empty());
+    check(network.peer(4).swarmState(2).connections.at(2).remoteBitfield[0] == 0);
+    check(network.peer(5).swarmState(1).connections.empty());
+    check(network.peer(6).swarmState(1).connections.empty());
+}
+
+void completionHaveOnlyOnFirstCompletion()
+{
+    RequestFixture f;
+    f.network.send(1, 2, 1, Message(MessageType::Request, RequestPayload{0, 0, 512}));
+    f.simulation.run();
+    check(std::none_of(f.events.begin(), f.events.end(), [](const auto& event) {
+        return event.details.messageType == MessageType::Have;
+    }));
+    // Both responses are outstanding before completion. The second is valid redundant data.
+    for (PeerId remote : {1u, 3u}) {
+        f.network.send(1, 2, remote, Message(MessageType::Request, RequestPayload{0, 512, 512}));
+    }
+    f.simulation.run();
+    check(f.network.peer(2).swarmState(1).localBitfield[0] == 0xc0);
+    check(f.outgoing().outgoingRequests.empty() && f.outgoing(1, 3).outgoingRequests.empty());
+    check(f.incoming().acceptedRequests.empty() && f.incoming(1, 3).acceptedRequests.empty());
+    for (PeerId remote : {1u, 3u}) {
+        check(std::count_if(f.events.begin(), f.events.end(), [remote](const auto& event) {
+            return event.kind == ExecutedKind::Request && event.details.messageType == MessageType::Have
+                && event.details.sender == 2 && event.details.receiver == remote && event.details.swarmId == 1;
+        }) == 1);
+        check(f.incoming(1, remote).remoteBitfield[0] == 0xc0);
+        check(f.incoming(2, remote).remoteBitfield[0] == 0x40);
+    }
+    const auto eventCount = f.events.size();
+    rejects([&] { f.network.deliver(1, 1, 2, Message(MessageType::Piece, PiecePayload{0, 512, 512})); });
+    f.simulation.run();
+    check(f.events.size() == eventCount);
+}
+
 void twoWayHandshakeLifecycle()
 {
     HandshakeFixture f;
@@ -1625,6 +1714,8 @@ int main()
 {
     struct Test { const char* name; void (*run)(); };
     const Test tests[] = {
+        {"Completion HAVE scope, FIFO and receive-side interest", completionHaveScopeFifoAndInterest},
+        {"Completion HAVE only on first full coverage", completionHaveOnlyOnFirstCompletion},
         {"PIECE requires established sender context", pieceRequiresEstablishedSenderContext},
         {"In-flight PIECE remains valid after choking", pieceInFlightSurvivesChoking},
         {"Queued PIECE revalidates outstanding request", queuedPieceRevalidatesOutstandingRequest},

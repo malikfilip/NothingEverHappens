@@ -70,6 +70,14 @@ namespace simulator {
             const auto& connections = to->swarmState(swarmId).connections;
             if (connections.contains(sender)) acceptedBefore = connections.at(sender).acceptedRequests.size();
         }
+        bool pieceWasOwned = false;
+        if (message.type() == MessageType::Piece && to->hasSwarm(swarmId)) {
+            const auto index = std::get<PiecePayload>(message.payload()).index;
+            if (index < currentSwarm.pieceCount()) {
+                pieceWasOwned = (to->swarmState(swarmId).localBitfield[index / 8]
+                    & (0x80u >> (index % 8))) != 0;
+            }
+        }
         to->receiveMessage(currentSwarm, sender, message, senderProtocolId,
             (message.type() == MessageType::Request || message.type() == MessageType::Piece) ? &peer(sender) : nullptr);
         if (message.type() == MessageType::Request
@@ -85,6 +93,21 @@ namespace simulator {
                 [sender](const Peer& candidate) { return candidate.id() == sender; });
             std::erase(from->swarm_states_.at(swarmId).connections.at(receiver).acceptedRequests,
                 RequestPayload{piece.index, piece.begin, piece.length});
+            const auto& state = to->swarmState(swarmId);
+            if (!pieceWasOwned && (state.localBitfield[piece.index / 8]
+                & (0x80u >> (piece.index % 8))) != 0) {
+                // Stable broadcast order; unordered connection storage must not affect tracing.
+                std::vector<PeerId> recipients;
+                for (const auto& [remote, connection] : state.connections) {
+                    if (connection.handshakeComplete()) recipients.push_back(remote);
+                }
+                std::sort(recipients.begin(), recipients.end());
+                for (const auto remote : recipients) {
+                    simulation_.schedule(std::make_unique<SendMessageEvent>(
+                        simulation_.currentTime(), *this, swarmId, receiver, remote,
+                        Message(MessageType::Have, HavePayload{piece.index})));
+                }
+            }
         }
         if (interestMessage) {
             const bool choking = to->swarmState(swarmId).connections.at(sender).weAreChokingRemote;
