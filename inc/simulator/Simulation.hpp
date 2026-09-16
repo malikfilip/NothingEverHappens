@@ -11,7 +11,8 @@ namespace simulator {
 
     class Simulation {
     public:
-        explicit Simulation(bool tracing = false);
+        explicit Simulation(bool tracing = false, std::uint64_t seed = 0);
+        std::uint64_t seed() const { return seed_; }
         void setTracing(bool enabled) { tracing_ = enabled; }
         // Called just before execution; the event reference is valid only during the callback.
         void setEventObserver(std::function<void(const Event&)> observer);
@@ -27,6 +28,7 @@ namespace simulator {
 
     private:
         void executeEvent(Event& event);
+        std::uint64_t seed_;
         bool tracing_;
         std::function<void(const Event&)> event_observer_;
         double current_time_;

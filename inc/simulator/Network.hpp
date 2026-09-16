@@ -9,6 +9,7 @@
 #include "simulator/Message.hpp"
 #include "simulator/Peer.hpp"
 #include "simulator/Swarm.hpp"
+#include "simulator/Tracker.hpp"
 
 namespace simulator {
 
@@ -34,7 +35,13 @@ namespace simulator {
     class Network {
     public:
         // Simulation must outlive this network, which owns its peers, links, and swarms.
-        Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms = {});
+        Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms = {}, std::size_t trackerMaximum = 50);
+
+        // Configure before discovery. Default cap is 8 per peer/swarm; zero disables admission.
+        // Rejects a cap below existing plus reserved neighbors.
+        void setMaxNeighbors(SwarmId swarmId, PeerId peer, std::size_t maximum);
+        // One-shot registration/discovery; validates membership and unique swarm info hashes.
+        void announceToTracker(SwarmId swarmId, PeerId peer, std::size_t numwant);
 
         // Enqueues transmission, starting immediately if idle; throws std::invalid_argument for missing endpoints,
         // a missing link, or invalid transfer bandwidth/latency.
@@ -107,6 +114,15 @@ namespace simulator {
         std::map<PeerId, PeerTransport> peer_transport_;
         std::map<TransmissionId, ActiveTransmission> active_transmissions_;
         TransmissionId next_transmission_id_ = 1;
+        struct DiscoveryState {
+            std::size_t maxNeighbors = 8;
+            std::set<PeerId> pending;
+        };
+        void validateTrackerSetup() const;
+        std::set<PeerId> neighbors(SwarmId swarmId, PeerId peer) const;
+        bool tryConnectPeer(SwarmId swarmId, PeerId local, PeerId remote);
+        Tracker tracker_;
+        std::map<std::pair<PeerId, SwarmId>, DiscoveryState> discovery_;
         Simulation& simulation_;
         std::vector<Peer> peers_;
         std::vector<Link> links_;

@@ -21,8 +21,8 @@ namespace simulator {
         constexpr std::size_t requestPipelineDepth = 5;
     }
 
-    Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms)
-        : simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
+    Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms, std::size_t trackerMaximum)
+        : tracker_(trackerMaximum, simulation.seed()), simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
     {
         for (std::size_t i = 0; i < peers_.size(); ++i) {
             peer_transport_.try_emplace(peers_[i].id(), PeerTransport{i, {}, {}});
@@ -189,6 +189,15 @@ namespace simulator {
         }
         if (message.type() == MessageType::Handshake) {
             sendInitialBitfield(*to, swarmId, sender);
+            const auto discovery = discovery_.find({receiver, swarmId});
+            if (discovery != discovery_.end() && discovery->second.pending.contains(sender)
+                && to->swarmState(swarmId).connections.at(sender).handshakeComplete()
+                && peer(sender).swarmState(swarmId).connections.at(receiver).handshakeComplete()) {
+                for (const auto& endpoints : {std::pair{sender, receiver}, std::pair{receiver, sender}}) {
+                    const auto found = discovery_.find({endpoints.first, swarmId});
+                    if (found != discovery_.end()) found->second.pending.erase(endpoints.second);
+                }
+            }
         }
         if (availability || message.type() == MessageType::Unchoke
             || message.type() == MessageType::Piece || message.type() == MessageType::Handshake) {

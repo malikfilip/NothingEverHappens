@@ -19,8 +19,8 @@ namespace simulator {
         }
     }
 
-    Simulation::Simulation(bool tracing)
-        : tracing_(tracing), current_time_(0.0),
+    Simulation::Simulation(bool tracing, std::uint64_t seed)
+        : seed_(seed), tracing_(tracing), current_time_(0.0),
           next_sequence_(0)
     {
     }
