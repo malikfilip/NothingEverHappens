@@ -218,11 +218,9 @@ namespace simulator {
             break;
         case MessageType::Interested:
             remote.remoteInterestedInUs = true;
-            remote.weAreChokingRemote = false;
             break;
         case MessageType::NotInterested:
             remote.remoteInterestedInUs = false;
-            remote.weAreChokingRemote = true;
             break;
         case MessageType::Bitfield:
             remote.remoteBitfield = std::get<BitfieldPayload>(message.payload()).bytes;

@@ -19,6 +19,7 @@ add_executable(bittorrent_simulator
         src/Swarm.cpp
         inc/simulator/Network.hpp
         src/Network.cpp
+        src/Choking.cpp
 )
 
 target_include_directories(bittorrent_simulator PRIVATE
@@ -35,6 +36,7 @@ if(BUILD_TESTING)
         src/Message.cpp
         src/Swarm.cpp
         src/Network.cpp
+        src/Choking.cpp
     )
     target_include_directories(message_delivery_tests PRIVATE inc)
     add_test(NAME message_delivery COMMAND message_delivery_tests)
@@ -46,7 +48,12 @@ if(BUILD_TESTING)
         src/Message.cpp
         src/Swarm.cpp
         src/Network.cpp
+        src/Choking.cpp
     )
     target_include_directories(multi_peer_integration_tests PRIVATE inc)
     add_test(NAME multi_peer_integration COMMAND multi_peer_integration_tests)
+    add_executable(choking_tests tests/ChokingTests.cpp src/Simulation.cpp src/Peer.cpp
+        src/Link.cpp src/Message.cpp src/Swarm.cpp src/Network.cpp src/Choking.cpp)
+    target_include_directories(choking_tests PRIVATE inc)
+    add_test(NAME choking COMMAND choking_tests)
 endif()

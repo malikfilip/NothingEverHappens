@@ -69,8 +69,19 @@ namespace simulator {
         friend class SendMessageEvent;
         friend class TransmissionCompleteEvent;
         friend class TransmissionStartEvent;
+        friend class RechokeEvent;
+        void scheduleRechoke(PeerId local, SwarmId swarmId);
+        void rechoke(PeerId local, SwarmId swarmId);
+        bool hasUsefulExchange(PeerId local, SwarmId swarmId) const;
+        static bool ownsAll(const Swarm& swarm, const PeerSwarmState& state);
+        static std::optional<PeerId> selectOptimistic(std::vector<PeerId> eligible,
+                                                    std::optional<PeerId> previous);
+        void setChoking(PeerId local, SwarmId swarmId, PeerId remote, bool choke);
+        void recordUsefulPiece(PeerId sender, PeerId receiver, SwarmId swarmId, std::uint64_t bytes);
+        void enforceInterestedLimit(PeerId local, SwarmId swarmId);
         // Network owns multiple peers, so the local requester is explicit.
         void tryScheduleRequests(Peer& requester, SwarmId swarmId, PeerId remotePeerId);
+        void sendScheduledPiece(SwarmId swarmId, PeerId sender, PeerId receiver, Message message);
         void sendScheduledRequest(SwarmId swarmId, PeerId sender, PeerId receiver, Message message);
         static std::optional<RequestPayload> nextRequestBlock(const Swarm& swarm,
             const PeerSwarmState& state, std::uint32_t piece, std::uint32_t begin = 0);

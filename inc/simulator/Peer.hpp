@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
+#include <optional>
 
 #include "simulator/SwarmId.hpp"
 #include "simulator/Message.hpp"
@@ -31,6 +32,14 @@ namespace simulator {
         // Reserved by automatic scheduling until the SendMessageEvent executes.
         std::vector<RequestPayload> scheduledRequests;
 
+        // Current and previous globally aligned 10-second buckets.
+        std::uint64_t downloadedInWindow = 0;
+        std::uint64_t uploadedInWindow = 0;
+        std::uint64_t downloadedPreviousInterval = 0;
+        std::uint64_t uploadedPreviousInterval = 0;
+        double recentDownloadRate = 0;
+        double recentUploadRate = 0;
+
         bool handshakeComplete() const { return handshakeSent && handshakeReceived; }
     };
 
@@ -40,11 +49,22 @@ namespace simulator {
         bool operator==(const BlockRange&) const = default;
     };
 
+    struct ChokingState {
+        bool eventPending = false;
+        bool managed = false;
+        double windowStart = 0; // Start of the current byte bucket.
+        double nextOptimisticRotation = 30;
+        std::optional<PeerId> optimistic;
+        std::optional<PeerId> optimisticCursor;
+    };
+
     struct PeerSwarmState {
+
         // Piece 0 is the high bit of byte 0; unused trailing bits are zero.
         std::vector<std::uint8_t> localBitfield;
         std::unordered_map<PeerId, PeerConnectionState> connections;
         std::unordered_map<std::uint32_t, std::vector<BlockRange>> receivedBlocks;
+        ChokingState choking;
     };
 
     class Peer {

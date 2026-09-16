@@ -1,4 +1,5 @@
 #include <cmath>
+#include <source_location>
 #include <limits>
 #include <algorithm>
 #include <functional>
@@ -15,9 +16,9 @@
 
 using namespace simulator;
 
-void check(bool condition)
+void check(bool condition, const std::source_location location = std::source_location::current())
 {
-    if (!condition) throw std::runtime_error("Message delivery check failed");
+    if (!condition) throw std::runtime_error("Message delivery check failed at line " + std::to_string(location.line()));
 }
 
 template<class Action>
@@ -1407,7 +1408,8 @@ void automaticBitfieldExchange()
     f.simulation.run();
     f.checkExchange(1);
     // BITFIELDs arrive at 2.488 and 2.588; interest announcements finish at 2.768.
-    check(std::abs(f.simulation.currentTime() - 2.948) < 1e-12);
+    // First periodic rechoke at t=10, then UNCHOKE transmission and propagation.
+    check(std::abs(f.simulation.currentTime() - 10.18) < 1e-12);
 
     const auto aBefore = f.network.peer(1).swarmState(1);
     const auto bBefore = f.network.peer(2).swarmState(1);
@@ -1463,7 +1465,8 @@ void simultaneousHandshakeBitfields()
     f.initiate(f.swarm, 2, 1);
     f.simulation.run();
     f.checkExchange(1);
-    check(std::abs(f.simulation.currentTime() - 1.76) < 1e-12);
+    // First periodic rechoke at t=10, then UNCHOKE transmission and propagation.
+    check(std::abs(f.simulation.currentTime() - 10.18) < 1e-12);
 }
 enum class ExecutedKind { Request, Start, Complete, Arrival };
 struct ExecutedMessage {
@@ -1761,41 +1764,34 @@ void initialLocalBitfield()
 void chokePolicyAndArrival()
 {
     InterestFixture f;
-    check(PeerConnectionState{}.weAreChokingRemote);
-    check(PeerConnectionState{}.remoteIsChokingUs);
-    f.receive(Message(MessageType::NotInterested)); // Initial no-op.
-    f.simulation.run();
-    check(f.events.empty());
+    check(PeerConnectionState{}.weAreChokingRemote && PeerConnectionState{}.remoteIsChokingUs);
+    f.receive(Message(MessageType::NotInterested));
+    f.simulation.run(); check(f.events.empty());
     f.receive(Message(MessageType::Interested));
     f.receive(Message(MessageType::Interested));
-    check(!f.local().weAreChokingRemote);
-    check(f.local().remoteIsChokingUs); // Other direction remains choked.
-    check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
-    f.simulation.schedule(std::make_unique<CheckEvent>(0.081, [&] {
-        // Transmission completed at .08, but arrival is .18.
+    check(f.local().weAreChokingRemote);
+    f.simulation.schedule(std::make_unique<CheckEvent>(10.081, [&] {
+        check(!f.local().weAreChokingRemote);
         check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
     }));
-    f.simulation.run();
-    checkEventTimes(f.events, 2, MessageType::Unchoke, 0, 0, .08, .18);
-    check(!f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
-    check(f.requests(MessageType::Unchoke) == 1);
-    f.receive(Message(MessageType::Interested));
-    f.simulation.run();
-    check(f.requests(MessageType::Unchoke) == 1);
-
-    f.receive(Message(MessageType::NotInterested));
-    f.receive(Message(MessageType::NotInterested));
-    check(f.local().weAreChokingRemote);
-    check(!f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
-    f.simulation.schedule(std::make_unique<CheckEvent>(.261, [&] {
+    f.simulation.schedule(std::make_unique<CheckEvent>(11, [&] {
+        f.receive(Message(MessageType::Interested)); // Duplicate decision stays suppressed.
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(12, [&] {
+        f.receive(Message(MessageType::NotInterested));
+        f.receive(Message(MessageType::NotInterested));
+        check(!f.local().weAreChokingRemote); // Choke waits for t=20.
+    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(20.081, [&] {
+        check(f.local().weAreChokingRemote);
         check(!f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
     }));
     f.simulation.run();
-    checkEventTimes(f.events, 2, MessageType::Choke, .18, .18, .26, .36);
-    check(f.requests(MessageType::Choke) == 1);
+    checkEventTimes(f.events, 2, MessageType::Unchoke, 10, 10, 10.08, 10.18);
+    checkEventTimes(f.events, 2, MessageType::Choke, 20, 20, 20.08, 20.18);
+    check(f.requests(MessageType::Choke) == 1 && f.requests(MessageType::Unchoke) == 1);
     check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
 }
-
 void chokePolicyScope()
 {
     InterestFixture f;
@@ -1823,23 +1819,19 @@ void chokePolicyScope()
 void chokePolicyUsesFifo()
 {
     InterestFixture f;
-    occupyDirection(f.network, 1, 2, 1);
     f.receive(Message(MessageType::Interested));
-    f.receive(Message(MessageType::NotInterested));
-    f.receive(Message(MessageType::NotInterested));
-    f.simulation.schedule(std::make_unique<CheckEvent>(.001, [&] {
-        check(f.network.transmissionState(2, 1).pendingCount == 9);
+    f.simulation.schedule(std::make_unique<CheckEvent>(9, [&] { occupyDirection(f.network, 1, 2, 1); }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(10.001, [&] {
+        check(f.network.transmissionState(2, 1).pendingCount > 0);
         check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
     }));
-    f.simulation.schedule(std::make_unique<CheckEvent>(2.357, [&] {
-        check(!f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
-    }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(12, [&] { f.receive(Message(MessageType::NotInterested)); }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(19, [&] { occupyDirection(f.network, 1, 2, 1); }));
     f.simulation.run();
-    checkEventTimes(f.events, 2, MessageType::Unchoke, 0, 2.176, 2.256, 2.356);
-    checkEventTimes(f.events, 2, MessageType::Choke, 0, 2.256, 2.336, 2.436);
+    checkEventTimes(f.events, 2, MessageType::Unchoke, 10, 11.176, 11.256, 11.356);
+    checkEventTimes(f.events, 2, MessageType::Choke, 20, 21.176, 21.256, 21.356);
     check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
-}
-struct RequestFixture {
+}struct RequestFixture {
     Swarm swarm{1, InfoHash{0x51}, 2500, 1024};
     Swarm other{2, InfoHash{0x52}, 1500, 1024};
     Peer a{1, 1000, 1000, PeerProtocolId{0xa1}};
@@ -2156,7 +2148,8 @@ void pieceRevalidatesAtTransmissionStart()
     f.network.send(1, 2, 1, Message(MessageType::Request, RequestPayload{0, 0, 128}));
     f.simulation.schedule(std::make_unique<CheckEvent>(start + .5, [&] {
         check(f.incoming().acceptedRequests.size() == 1); // PIECE already queued.
-        f.network.deliver(1, 2, 1, Message(MessageType::NotInterested));
+        // Bypass policy scheduling to exercise defensive transmission-start validation.
+        const_cast<PeerConnectionState&>(f.incoming()).weAreChokingRemote = true;
     }));
     rejects([&] { f.simulation.run(); });
     check(f.network.peer(2).swarmState(1).receivedBlocks.empty());
@@ -2496,7 +2489,11 @@ void schedulerGatesReservationsAndResume()
     check(f.connection().scheduledRequests.size() == 5);
     // Choke arrives before the reserved send events execute; reservations must be released.
     f.network.deliver(1, 1, 2, Message(MessageType::Choke));
-    f.simulation.run();
+    // This fixture deliberately injects a receive-side CHOKE without changing
+    // the sender. Inspect the reservation behavior before the periodic policy tick.
+    struct Pause {};
+    f.simulation.schedule(std::make_unique<CheckEvent>(.1, [] { throw Pause{}; }));
+    try { f.simulation.run(); } catch (const Pause&) {}
     check(f.connection().scheduledRequests.empty() && f.connection().outgoingRequests.empty());
     check(std::none_of(events.begin(), events.end(), [](const auto& event) {
         return event.kind == ExecutedKind::Start && event.details.messageType == MessageType::Request;
@@ -2810,6 +2807,7 @@ void handshakeArrivalTiming()
 
 int main()
 {
+    std::cout << std::unitbuf;
     struct Test { const char* name; void (*run)(); };
     const Test tests[] = {
         {"Explicit deterministic 6/4/4 Mbps sharing and release", equalShareExplicitSixFourFour},
