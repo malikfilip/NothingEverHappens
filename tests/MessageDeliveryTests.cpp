@@ -2399,6 +2399,169 @@ struct SchedulingFixture {
     }
 };
 
+struct RarityFixture {
+    Swarm swarm{1, InfoHash{1}, 300000, 100000};
+    Swarm other{2, InfoHash{2}, 300000, 100000};
+    Simulation simulation;
+    Network network;
+    RarityFixture() : network(simulation, joinedPeers(),
+        {Link(1, 3, 1e6, .01), Link(1, 4, 1e6, .01), Link(1, 5, 1e6, .01),
+         Link(2, 3, 1e6, .01), Link(2, 4, 1e6, .01), Link(2, 5, 1e6, .01)}, {swarm, other}) {}
+    std::vector<Peer> joinedPeers() {
+        std::vector<Peer> peers;
+        for (PeerId id = 1; id <= 5; ++id) {
+            peers.emplace_back(id, 2e6, 2e6);
+            for (const auto* s : {&swarm, &other}) peers.back().joinSwarm(*s, {static_cast<std::uint8_t>(id <= 2 ? 0 : 0xe0)});
+        }
+        for (const auto* s : {&swarm, &other}) for (PeerId local : {1u, 2u}) for (PeerId remote : {3u, 4u, 5u}) {
+            auto& a = peers[local - 1]; auto& b = peers[remote - 1];
+            a.markHandshakeSent(*s, remote); b.markHandshakeSent(*s, local);
+            a.receiveMessage(*s, remote, handshake(*s, b.protocolId()), &b.protocolId());
+            b.receiveMessage(*s, local, handshake(*s, a.protocolId()), &a.protocolId());
+            auto& from = const_cast<PeerSwarmState&>(b.swarmState(s->id())).connections.at(local);
+            from.weAreChokingRemote = false;
+            from.bitfieldSent = true;
+            const_cast<PeerSwarmState&>(a.swarmState(s->id())).connections.at(remote).bitfieldSent = true;
+        }
+        return peers;
+    }
+    PeerSwarmState& state(PeerId local = 1, SwarmId swarmId = 1) {
+        return const_cast<PeerSwarmState&>(network.peer(local).swarmState(swarmId));
+    }
+    void advertise(PeerId remote, std::uint8_t bits, PeerId local = 1, SwarmId swarmId = 1) {
+        network.deliver(swarmId, remote, local, Message(MessageType::Bitfield, BitfieldPayload{{bits}}));
+    }
+    void unchoke(PeerId remote = 3, PeerId local = 1, SwarmId swarmId = 1) {
+        network.deliver(swarmId, remote, local, Message(MessageType::Unchoke));
+    }
+    const RequestPayload& first(PeerId local = 1, SwarmId swarmId = 1, PeerId remote = 3) {
+        const auto& requests = state(local, swarmId).connections.at(remote).scheduledRequests;
+        check(!requests.empty());
+        return requests.front();
+    }
+};
+void rarestOverLowerIndex() {
+    RarityFixture f;
+    f.advertise(3, 0xe0); f.advertise(4, 0xc0); f.advertise(5, 0x80);
+    f.unchoke();
+    check(f.first() == RequestPayload{2, 0, 16384}); // Counts: 3, 2, 1.
+}
+void rarityTieByIndex() {
+    RarityFixture f;
+    f.advertise(3, 0xe0); f.advertise(4, 0xe0);
+    f.unchoke();
+    check(f.first() == RequestPayload{0, 0, 16384});
+}
+void rarityIncludesChokedRemote() {
+    RarityFixture f;
+    f.advertise(3, 0xc0); f.advertise(4, 0x80);
+    check(f.state().connections.at(4).remoteIsChokingUs);
+    f.unchoke();
+    check(f.first().index == 1);
+}
+void rarityUnknownIsNotGlobalInventory() {
+    RarityFixture f;
+    // Actual inventories differ from the requester's unadvertised, zero knowledge.
+    f.state(4).localBitfield = {0x80}; f.state(5).localBitfield = {0x80};
+    f.advertise(3, 0xc0);
+    f.unchoke();
+    check(f.first().index == 0); // Only peer 3 is known to offer either piece.
+}
+void rarityRequiresEstablishedConnection() {
+    RarityFixture f;
+    f.advertise(3, 0xc0);
+    auto& unestablished = f.state().connections.at(4);
+    unestablished.remoteBitfield = {0x80};
+    unestablished.handshakeReceived = false;
+    f.unchoke();
+    check(f.first().index == 0);
+}
+void rarityRepeatedHaveIsIdempotent() {
+    RarityFixture f;
+    f.advertise(3, 0xc0); f.advertise(4, 0x80); f.advertise(5, 0x40);
+    for (int i = 0; i < 5; ++i) f.network.deliver(1, 4, 1, Message(MessageType::Have, HavePayload{0}));
+    f.unchoke();
+    check(f.first().index == 0); // Two known copies each; repeated HAVE is not another copy.
+}
+void rarityBitfieldReplacement() {
+    for (bool replace : {false, true}) {
+        RarityFixture f;
+        f.advertise(3, 0xc0); f.advertise(4, 0x80);
+        if (replace) f.advertise(4, 0x40);
+        f.unchoke();
+        check(f.first().index == (replace ? 0u : 1u));
+    }
+}
+void raritySkipsCompletedAndReserved() {
+    for (bool outgoing : {false, true}) {
+        RarityFixture f;
+        f.state().localBitfield = {0x80};
+        f.state().receivedBlocks[2] = {{0, 1024}, {2048, 4096}};
+        auto& remote = f.state().connections.at(4);
+        (outgoing ? remote.outgoingRequests : remote.scheduledRequests).push_back({1, 0, 100000});
+        f.advertise(3, 0xe0);
+        f.unchoke();
+        check(f.first() == RequestPayload{2, 1024, 1024}); // Preserve gap-sized block selection.
+    }
+}
+void rarityTargetEligibility() {
+    RarityFixture f;
+    f.advertise(3, 0xc0); f.advertise(4, 0x80); f.advertise(5, 0x80);
+    f.state(3).localBitfield = {0x80}; // Target cannot actually supply the advertised rarer piece 1.
+    f.unchoke();
+    check(f.first().index == 0);
+    RarityFixture unknown;
+    unknown.advertise(3, 0x80); // Actual target owns more, but those pieces are not advertised.
+    unknown.unchoke();
+    check(unknown.first().index == 0);
+}
+void raritySimultaneousUnchokes() {
+    RarityFixture f;
+    f.advertise(3, 0xe0); f.advertise(4, 0xe0); f.advertise(5, 0xc0);
+    std::vector<RequestPayload> started;
+    bool usedThree = false, usedFour = false;
+    f.simulation.setEventObserver([&](const Event& event) {
+        check(event.time() < 100); // Completion must drain the policy timers too.
+        std::vector<RequestPayload> reserved;
+        for (const auto& [id, c] : f.state().connections) {
+            check(c.scheduledRequests.size() + c.outgoingRequests.size() <= 5);
+            for (const auto* requests : {&c.scheduledRequests, &c.outgoingRequests}) for (const auto& block : *requests) {
+                for (const auto& earlier : reserved) if (earlier.index == block.index)
+                    check(block.begin >= earlier.begin + earlier.length || earlier.begin >= block.begin + block.length);
+                reserved.push_back(block);
+            }
+        }
+        if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+            start && start->details().sender == 1 && start->details().messageType == MessageType::Request) {
+            const auto block = std::get<RequestPayload>(start->message().payload());
+            if (started.empty()) check(block.index == 2);
+            for (const auto& earlier : started) if (earlier.index == block.index)
+                check(block.begin >= earlier.begin + earlier.length || earlier.begin >= block.begin + block.length);
+            started.push_back(block);
+            usedThree |= start->details().receiver == 3;
+            usedFour |= start->details().receiver == 4;
+        }
+    });
+    for (PeerId remote : {3u, 4u}) f.simulation.schedule(std::make_unique<SendMessageEvent>(
+        0, f.network, 1, remote, 1, Message(MessageType::Unchoke)));
+    f.simulation.run();
+    check(usedThree && usedFour && f.state().localBitfield[0] == 0xe0);
+    for (const auto& [id, c] : f.state().connections) check(c.scheduledRequests.empty() && c.outgoingRequests.empty());
+}
+void rarityPerPeerIsolation() {
+    RarityFixture f;
+    f.advertise(3, 0xc0, 1); f.advertise(4, 0x80, 1);
+    f.advertise(3, 0xc0, 2); f.advertise(4, 0x40, 2);
+    f.unchoke(3, 1); f.unchoke(3, 2);
+    check(f.first(1).index == 1 && f.first(2).index == 0);
+}
+void rarityPerSwarmIsolation() {
+    RarityFixture f;
+    f.advertise(3, 0xc0, 1, 1); f.advertise(4, 0x80, 1, 1);
+    f.advertise(3, 0xc0, 1, 2); f.advertise(4, 0x40, 1, 2);
+    f.unchoke(3, 1, 1); f.unchoke(3, 1, 2);
+    check(f.first(1, 1).index == 1 && f.first(1, 2).index == 0);
+}
 void completionReevaluatesInterestAcrossConnections()
 {
     SchedulingFixture f;
@@ -2412,7 +2575,14 @@ void completionReevaluatesInterestAcrossConnections()
     const auto otherBefore = other;
     std::vector<ExecutedMessage> events;
     unsigned notInterestedToOne = 0, notInterestedToThree = 0;
+    bool usefulAfterRarerPiece = false;
     f.simulation.setEventObserver([&](const Event& event) {
+        if (const auto* send = dynamic_cast<const SendMessageEvent*>(&event);
+            send && send->details().messageType == MessageType::Have && state.localBitfield[0] == 0x40) {
+            // Piece 1 is rarer and completes first; both remotes still offer piece 0.
+            check(f.connection().weAreInterestedInRemote && f.connection(1, 3).weAreInterestedInRemote);
+            usefulAfterRarerPiece = true;
+        }
         if (const auto* send = dynamic_cast<const SendMessageEvent*>(&event);
             send && send->details().messageType == MessageType::NotInterested) {
             const auto details = send->details();
@@ -2422,8 +2592,8 @@ void completionReevaluatesInterestAcrossConnections()
             check(f.network.peer(details.receiver).swarmState(1).connections.at(2).remoteInterestedInUs);
             if (details.receiver == 3) {
                 ++notInterestedToThree;
-                check(state.localBitfield[0] == 0x80);
-                check(f.connection().weAreInterestedInRemote); // Peer 1 still offers piece 1.
+                check(state.localBitfield[0] == 0xc0);
+                check(!f.connection().weAreInterestedInRemote); // Both advertised pieces are complete.
             } else {
                 check(details.receiver == 1);
                 ++notInterestedToOne;
@@ -2448,7 +2618,7 @@ void completionReevaluatesInterestAcrossConnections()
     f.network.deliver(1, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0xc0}}));
     f.network.deliver(1, 1, 2, Message(MessageType::Unchoke));
     f.simulation.run();
-    check(notInterestedToOne == 1 && notInterestedToThree == 1);
+    check(usefulAfterRarerPiece && notInterestedToOne == 1 && notInterestedToThree == 1);
     for (PeerId remote : {1u, 3u}) {
         std::vector<ExecutedMessage> flow;
         for (const auto& event : events) if (event.details.receiver == remote) flow.push_back(event);
@@ -2466,7 +2636,7 @@ void completionReevaluatesInterestAcrossConnections()
     f.network.deliver(1, 1, 2, Message(MessageType::Have, HavePayload{1}));
     f.network.deliver(1, 3, 2, Message(MessageType::Have, HavePayload{0}));
     f.simulation.run();
-    check(notInterestedToOne == 1 && notInterestedToThree == 1);
+    check(usefulAfterRarerPiece && notInterestedToOne == 1 && notInterestedToThree == 1);
 }
 
 void schedulerGatesReservationsAndResume()
@@ -2838,6 +3008,18 @@ int main()
         {"Active transmission lifecycle", activeTransmissionLifecycle},
         {"Arrival scheduled only by valid completion", arrivalScheduledByCompletion},
         {"Stale completion has no transport or protocol effects", staleCompletionNoOp},
+        {"Rarest piece beats lower-index common pieces", rarestOverLowerIndex},
+        {"Equal rarity breaks ties by piece index", rarityTieByIndex},
+        {"Choked known remote contributes to rarity", rarityIncludesChokedRemote},
+        {"Unknown availability does not reveal actual inventories", rarityUnknownIsNotGlobalInventory},
+        {"Unestablished connection does not contribute to rarity", rarityRequiresEstablishedConnection},
+        {"Repeated HAVE does not inflate rarity", rarityRepeatedHaveIsIdempotent},
+        {"BITFIELD replacement updates rarity", rarityBitfieldReplacement},
+        {"Rarity skips completed and reserved pieces and preserves gaps", raritySkipsCompletedAndReserved},
+        {"Rarity retains target ownership and advertisement safeguards", rarityTargetEligibility},
+        {"Simultaneous unchokes reserve non-overlapping rarest-first blocks", raritySimultaneousUnchokes},
+        {"Rarity knowledge is isolated per peer", rarityPerPeerIsolation},
+        {"Rarity knowledge is isolated per swarm", rarityPerSwarmIsolation},
         {"Piece completion reevaluates all swarm connections through FIFO", completionReevaluatesInterestAcrossConnections},
         {"Autonomous sequential pipeline, refill and short blocks", autonomousSequentialPipeline},
         {"Scheduler gates, duplicate reservations and unchoke resume", schedulerGatesReservationsAndResume},

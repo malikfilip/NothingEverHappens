@@ -230,15 +230,28 @@ namespace simulator {
         const PeerSwarmState& state, const PeerConnectionState& connection,
         const PeerSwarmState& remoteState)
     {
-        // Sequential: only this helper defines the piece-selection strategy.
+        std::optional<std::uint32_t> selected;
+        std::size_t lowestAvailability = 0;
         for (std::uint32_t piece = 0; piece < swarm.pieceCount(); ++piece) {
             const auto mask = 0x80u >> (piece % 8);
-            if ((state.localBitfield[piece / 8] & mask) == 0
-                && (connection.remoteBitfield[piece / 8] & mask) != 0
-                && (remoteState.localBitfield[piece / 8] & mask) != 0
-                && nextRequestBlock(swarm, state, piece)) return piece;
+            if ((state.localBitfield[piece / 8] & mask) != 0
+                || (connection.remoteBitfield[piece / 8] & mask) == 0
+                || (remoteState.localBitfield[piece / 8] & mask) == 0
+                || !nextRequestBlock(swarm, state, piece)) continue;
+
+            // Rarity uses only this requester's knowledge, including choked remotes.
+            // The target's actual inventory above remains an eligibility safeguard.
+            std::size_t availability = 0;
+            for (const auto& [remote, known] : state.connections) {
+                if (known.handshakeComplete() && (known.remoteBitfield[piece / 8] & mask) != 0) ++availability;
+            }
+            // Ascending traversal and strict comparison break ties by piece index.
+            if (!selected || availability < lowestAvailability) {
+                selected = piece;
+                lowestAvailability = availability;
+            }
         }
-        return std::nullopt;
+        return selected;
     }
 
     void Network::tryScheduleRequests(Peer& requester, SwarmId swarmId, PeerId remotePeerId)
