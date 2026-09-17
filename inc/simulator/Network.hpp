@@ -108,10 +108,14 @@ namespace simulator {
         void enforceInterestedLimit(PeerId local, SwarmId swarmId);
         // Network owns multiple peers, so the local requester is explicit.
         void tryScheduleRequests(Peer& requester, SwarmId swarmId, PeerId remotePeerId);
+        static bool endgameReady(const Swarm& swarm, const PeerSwarmState& state);
+        static std::optional<RequestPayload> endgameBlock(const Swarm& swarm,
+            const PeerSwarmState& state, PeerId remote);
         void sendScheduledPiece(SwarmId swarmId, PeerId sender, PeerId receiver, Message message, LifecycleContext context);
         void sendScheduledRequest(SwarmId swarmId, PeerId sender, PeerId receiver, Message message, LifecycleContext context);
         static std::optional<RequestPayload> nextRequestBlock(const Swarm& swarm,
-            const PeerSwarmState& state, std::uint32_t piece, std::uint32_t begin = 0);
+            const PeerSwarmState& state, std::uint32_t piece, std::uint32_t begin = 0,
+            const std::vector<RequestPayload>* retiredAtTarget = nullptr);
         static std::optional<std::uint32_t> selectPiece(const Swarm& swarm,
             const PeerSwarmState& state, const PeerConnectionState& connection,
             const PeerSwarmState& remoteState);

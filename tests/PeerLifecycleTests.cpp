@@ -274,6 +274,7 @@ void lateJoinFilledOutgoingTargets() {
     });
     bool started = false;
     unsigned pieceArrivals = 0;
+    std::set<PeerId> pieceProviders;
     sim.setEventObserver([&](const Event& event) {
         if (const auto* announce = dynamic_cast<const TrackerAnnounceEvent*>(&event);
             announce && announce->peerId() == 9 && announce->kind() == AnnounceKind::Started) {
@@ -281,8 +282,13 @@ void lateJoinFilledOutgoingTargets() {
             started = true;
         }
         if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event);
-            arrival && arrival->details().receiver == 9 && arrival->details().messageType == MessageType::Piece)
+            arrival && arrival->details().receiver == 9 && arrival->details().messageType == MessageType::Piece) {
+            check(pieceProviders.insert(arrival->details().sender).second, "Repeated PIECE from the same provider");
+            if (pieceArrivals > 0)
+                check(net.peer(9).swarmState(1).connections.at(arrival->details().sender).retiredRequests
+                    == std::vector<RequestPayload>{{0, 0, 16384}}, "Late PIECE was not legitimately retired");
             ++pieceArrivals;
+        }
     });
     at(sim, 2, [&] { net.joinSwarm(1, 9, JoinOptions{2, 2, std::nullopt}); });
     at(sim, 3, [&] {
@@ -299,7 +305,7 @@ void lateJoinFilledOutgoingTargets() {
     });
     at(sim, 12, [&] {
         const auto& state = net.peer(9).swarmState(1);
-        check(pieceArrivals == 1 && state.localBitfield == std::vector<std::uint8_t>{0x80}
+        check(pieceArrivals >= 1 && pieceArrivals <= state.connections.size() && state.localBitfield == std::vector<std::uint8_t>{0x80}
             && state.receivedBlocks.at(0) == std::vector<BlockRange>{{0, 16384}}, "Late peer failed automatic download");
     });
     for (PeerId id = 1; id <= 9; ++id) leaveAt(sim, net, 13, id);

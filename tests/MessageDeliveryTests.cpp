@@ -1,6 +1,7 @@
 #include <cmath>
 #include <source_location>
 #include <limits>
+#include "EndgameAssertions.hpp"
 #include <algorithm>
 #include <functional>
 #include <iostream>
@@ -96,9 +97,9 @@ int existingDeliveryRegression()
         check(receiver.swarmState(2).connections.at(1).remoteBitfield[0] == 0xff);
         for (const auto& message : {
                 handshake(swarm),
-                Message(MessageType::Cancel, CancelPayload{}),
-                Message(MessageType::Cancel, CancelPayload{}),
-                Message(MessageType::Cancel, CancelPayload{})}) {
+                Message(MessageType::Choke),
+                Message(MessageType::Choke),
+                Message(MessageType::Choke)}) {
             receive(message);
         }
         check(remote().remoteIsChokingUs && !remote().remoteInterestedInUs);
@@ -160,6 +161,8 @@ void checkUnchanged(const PeerSwarmState& actual, const PeerSwarmState& before)
         check(connection.outgoingRequests == expected.outgoingRequests);
         check(connection.acceptedRequests == expected.acceptedRequests);
         check(connection.scheduledRequests == expected.scheduledRequests);
+        check(connection.retiredRequests == expected.retiredRequests);
+        check(connection.committedRequests == expected.committedRequests);
         check(connection.weAreInterestedInRemote == expected.weAreInterestedInRemote);
         check(connection.handshakeComplete() == expected.handshakeComplete());
         check(connection.remoteIsChokingUs == expected.remoteIsChokingUs);
@@ -329,6 +332,21 @@ void arrivalTiming()
     check(observations == 3);
     check(!network.peer(2).swarmState(1).connections.at(1).remoteIsChokingUs);
 }
+void addIncompleteConnection(Network& network, const Swarm& swarm, PeerId local, PeerId remote) {
+    auto& state = const_cast<PeerSwarmState&>(network.peer(local).swarmState(swarm.id()));
+    auto& connection = state.connections.try_emplace(remote).first->second;
+    connection.remoteBitfield.resize(state.localBitfield.size(), 0);
+}
+const Swarm fillerSwarm{999, InfoHash{0xfe}, 1, 1};
+std::vector<Peer> withFiller(std::vector<Peer> peers) {
+    for (auto& p : peers) p.joinSwarm(fillerSwarm, {0x80});
+    for (auto& a : peers) for (auto& b : peers) if (a.id() != b.id()) {
+        a.markHandshakeSent(fillerSwarm, b.id());
+        a.receiveMessage(fillerSwarm, b.id(), handshake(fillerSwarm, b.protocolId()), &b.protocolId());
+        const_cast<PeerSwarmState&>(a.swarmState(999)).connections.at(b.id()).bitfieldSent = true;
+    }
+    return peers;
+}
 struct HandshakeFixture {
     Swarm swarm{1, InfoHash{0x13, 0x57}, 9};
     Swarm other{2, InfoHash{0x24}, 9};
@@ -339,7 +357,7 @@ struct HandshakeFixture {
     Network network;
 
     HandshakeFixture()
-        : network(simulation, joinedPeers(), {Link(1, 2, 800, 0.1), Link(2, 3, 800, 0.1)}, {swarm, other}) {}
+        : network(simulation, withFiller(joinedPeers()), {Link(1, 2, 800, 0.1), Link(2, 3, 800, 0.1)}, {swarm, other, fillerSwarm}) {}
     std::vector<Peer> joinedPeers() {
         for (Peer* peer : {&sender, &receiver, &third}) {
             peer->joinSwarm(swarm);
@@ -365,14 +383,14 @@ private:
 };
 
 struct QueueFixture {
-    Swarm swarm{1, InfoHash{0x42}, 8};
+    Swarm swarm{1, InfoHash{0x42}, 8, 1};
     Peer a{1, 1000, 1000, PeerProtocolId{0xa1}};
     Peer b{2, 1000, 1000, PeerProtocolId{0xb2}};
     Simulation simulation;
     Network network;
 
     explicit QueueFixture(double latency = 1.0, double bandwidth = 800)
-        : network(simulation, joinedPeers(), {Link(1, 2, bandwidth, latency)}, {swarm}) {}
+        : network(simulation, withFiller(joinedPeers()), {Link(1, 2, bandwidth, latency)}, {swarm, fillerSwarm}) {}
     std::vector<Peer> joinedPeers() {
         // Transport-only fixture: all pieces owned, so availability adds no interest traffic.
         a.joinSwarm(swarm, {0xff});
@@ -620,7 +638,7 @@ void mbpsFullDuplex() { mbpsUnaffected(false); }
 void mbpsIndependentLink() { mbpsUnaffected(true); }
 
 struct SharingFixture {
-    Swarm swarm{1, InfoHash{0x42}, 8};
+    Swarm swarm{1, InfoHash{0x42}, 8, 1};
     Simulation simulation;
     Network network;
     std::vector<Peer> peers(const std::vector<double>& upload, const std::vector<double>& download) {
@@ -643,7 +661,7 @@ struct SharingFixture {
              Link(2, 3, 1e8, .25), Link(2, 4, 1e8, .25), Link(3, 4, 1e8, .25)}, {swarm}) {}
     TransmissionId send(PeerId sender, PeerId receiver, bool shortMessage = false) {
         network.send(1, sender, receiver, shortMessage ? Message(MessageType::Unchoke)
-            : Message(MessageType::Cancel, CancelPayload{}));
+            : Message(MessageType::Cancel, CancelPayload{0, 0, 1}));
         invariant();
         for (const auto& [id, active] : network.activeTransmissions()) {
             if (active.sender == sender && active.receiver == receiver) return id;
@@ -897,7 +915,7 @@ void equalShareSameTimestamp()
         SharingFixture f;
         for (PeerId receiver : {2u, 3u, 4u}) {
             f.simulation.schedule(std::make_unique<SendMessageEvent>(0, f.network, 1, 1, receiver,
-                Message(MessageType::Cancel, CancelPayload{})));
+                Message(MessageType::Cancel, CancelPayload{0, 0, 1})));
         }
         f.at(0, [&] {
             check(f.network.activeTransmissions().size() == 3);
@@ -936,7 +954,7 @@ void equalShareAggregateTransitions()
     for (PeerId sender = 1; sender <= 4; ++sender) for (PeerId receiver = 1; receiver <= 4; ++receiver) {
         if (sender == receiver) continue;
         f.simulation.schedule(std::make_unique<SendMessageEvent>((sender - 1) * 1e-6,
-            f.network, 1, sender, receiver, Message(MessageType::Cancel, CancelPayload{})));
+            f.network, 1, sender, receiver, Message(MessageType::Cancel, CancelPayload{0, 0, 1})));
         f.simulation.schedule(std::make_unique<SendMessageEvent>((sender - 1) * 1e-6,
             f.network, 1, sender, receiver, Message(MessageType::Unchoke)));
     }
@@ -1296,7 +1314,7 @@ void enqueueAtCompletion()
 void occupyDirection(Network& network, SwarmId swarm, PeerId sender, PeerId receiver)
 {
     // Eight 17-byte CANCEL messages occupy 2.176 seconds at 500 bits/sec.
-    for (int i = 0; i < 8; ++i) network.send(swarm, sender, receiver, Message(MessageType::Cancel, CancelPayload{}));
+    for (int i = 0; i < 8; ++i) network.send(fillerSwarm.id(), sender, receiver, Message(MessageType::Cancel, CancelPayload{0, 0, 1}));
 }
 
 void queuedHandshakeResponse()
@@ -1338,8 +1356,8 @@ struct AutoBitfieldFixture {
     Network network;
 
     AutoBitfieldFixture()
-        : network(simulation, joinedPeers(),
-            {Link(1, 2, 800, 0.1), Link(2, 3, 800, 0.1)}, {swarm, other}) {}
+        : network(simulation, withFiller(joinedPeers()),
+            {Link(1, 2, 800, 0.1), Link(2, 3, 800, 0.1)}, {swarm, other, fillerSwarm}) {}
     std::vector<Peer> joinedPeers() {
         for (Peer* peer : {&a, &b, &c}) {
             peer->joinSwarm(swarm);
@@ -1426,8 +1444,8 @@ void automaticBitfieldScope()
 {
     AutoBitfieldFixture f;
     // Default connections for the second swarm and another remote peer.
-    f.network.deliver(2, 1, 2, Message(MessageType::Cancel, CancelPayload{}));
-    f.network.deliver(1, 3, 2, Message(MessageType::Cancel, CancelPayload{}));
+    addIncompleteConnection(f.network, f.other, 2, 1);
+    addIncompleteConnection(f.network, f.swarm, 2, 3);
     f.initiate(f.swarm);
     f.simulation.run();
     f.checkExchange(1);
@@ -1521,7 +1539,7 @@ void exactTransmissionEventTimes()
     std::vector<ExecutedMessage> events;
     observeMessages(f.simulation, events);
     // 17 bytes at 800 bits/sec occupy A -> B from 5.0 through 5.17.
-    f.send(5.0, 1, Message(MessageType::Cancel, CancelPayload{}));
+    f.send(5.0, 1, Message(MessageType::Cancel, CancelPayload{0, 0, 1}));
     f.send(5.1, 1, Message(MessageType::Have, HavePayload{7}));
     f.simulation.run();
     checkEventTimes(events, 1, MessageType::Cancel, 5.0, 5.0, 5.17, 5.27);
@@ -1601,8 +1619,8 @@ struct InterestFixture {
     std::vector<ExecutedMessage> events;
 
     InterestFixture()
-        : network(simulation, joinedPeers(), {Link(1, 2, 800, 0.1), Link(2, 3, 800, 0.1)},
-                  {swarm, other}) { observeMessages(simulation, events); }
+        : network(simulation, withFiller(joinedPeers()), {Link(1, 2, 800, 0.1), Link(2, 3, 800, 0.1)},
+                  {swarm, other, fillerSwarm}) { observeMessages(simulation, events); }
     std::vector<Peer> joinedPeers() {
         for (Peer* peer : {&a, &b, &c}) {
             peer->joinSwarm(swarm, peer == &b ? std::vector<std::uint8_t>{0x80, 0}
@@ -1842,8 +1860,8 @@ void chokePolicyUsesFifo()
     std::vector<ExecutedMessage> events;
 
     RequestFixture(bool ownsFirst = true, bool ownsSecond = false)
-        : network(simulation, joinedPeers(ownsFirst, ownsSecond), {Link(1, 2, 800, .1), Link(2, 3, 800, .1)},
-                  {swarm, other}) {
+        : network(simulation, withFiller(joinedPeers(ownsFirst, ownsSecond)), {Link(1, 2, 800, .1), Link(2, 3, 800, .1)},
+                  {swarm, other, fillerSwarm}) {
         observeMessages(simulation, events);
     }
     std::vector<Peer> joinedPeers(bool ownsFirst, bool ownsSecond) {
@@ -2222,9 +2240,9 @@ void completionHaveScopeFifoAndInterest()
     }
     peers[1].markHandshakeSent(swarm, 5); // Incomplete connection must not receive HAVE.
     Simulation simulation;
-    Network network(simulation, peers,
+    Network network(simulation, withFiller(peers),
         {Link(2, 1, 500, .1), Link(2, 3, 500, .1), Link(2, 4, 500, .1),
-         Link(2, 5, 500, .1), Link(2, 6, 500, .1)}, {swarm, other});
+         Link(2, 5, 500, .1), Link(2, 6, 500, .1)}, {swarm, other, fillerSwarm});
     for (PeerId remote : {1u, 3u}) network.send(1, 2, remote, handshake(swarm, peers[1].protocolId()));
     network.send(2, 2, 4, handshake(other, peers[1].protocolId()));
     simulation.run();
@@ -2370,8 +2388,8 @@ struct SchedulingFixture {
     Swarm other{2, InfoHash{2}, 200000, 100000};
     Simulation simulation;
     Network network;
-    SchedulingFixture() : network(simulation, joinedPeers(),
-        {Link(1, 2, 1000000, .01), Link(2, 3, 1000000, .01)}, {swarm, other}) {}
+    SchedulingFixture() : network(simulation, withFiller(joinedPeers()),
+        {Link(1, 2, 1000000, .01), Link(2, 3, 1000000, .01)}, {swarm, other, fillerSwarm}) {}
     std::vector<Peer> joinedPeers() {
         std::vector<Peer> peers;
         for (PeerId id : {1u, 2u, 3u}) {
@@ -2404,9 +2422,9 @@ struct RarityFixture {
     Swarm other{2, InfoHash{2}, 300000, 100000};
     Simulation simulation;
     Network network;
-    RarityFixture() : network(simulation, joinedPeers(),
+    RarityFixture() : network(simulation, withFiller(joinedPeers()),
         {Link(1, 3, 1e6, .01), Link(1, 4, 1e6, .01), Link(1, 5, 1e6, .01),
-         Link(2, 3, 1e6, .01), Link(2, 4, 1e6, .01), Link(2, 5, 1e6, .01)}, {swarm, other}) {}
+         Link(2, 3, 1e6, .01), Link(2, 4, 1e6, .01), Link(2, 5, 1e6, .01)}, {swarm, other, fillerSwarm}) {}
     std::vector<Peer> joinedPeers() {
         std::vector<Peer> peers;
         for (PeerId id = 1; id <= 5; ++id) {
@@ -2518,26 +2536,22 @@ void rarityTargetEligibility() {
 void raritySimultaneousUnchokes() {
     RarityFixture f;
     f.advertise(3, 0xe0); f.advertise(4, 0xe0); f.advertise(5, 0xc0);
-    std::vector<RequestPayload> started;
+    std::vector<std::pair<PeerId, RequestPayload>> started;
     bool usedThree = false, usedFour = false;
     f.simulation.setEventObserver([&](const Event& event) {
         check(event.time() < 100); // Completion must drain the policy timers too.
-        std::vector<RequestPayload> reserved;
-        for (const auto& [id, c] : f.state().connections) {
-            check(c.scheduledRequests.size() + c.outgoingRequests.size() <= 5);
-            for (const auto* requests : {&c.scheduledRequests, &c.outgoingRequests}) for (const auto& block : *requests) {
-                for (const auto& earlier : reserved) if (earlier.index == block.index)
-                    check(block.begin >= earlier.begin + earlier.length || earlier.begin >= block.begin + block.length);
-                reserved.push_back(block);
-            }
-        }
+        const auto* starting = dynamic_cast<const TransmissionStartEvent*>(&event);
+        const auto sending = starting && starting->details().sender == 1
+            && starting->details().messageType == MessageType::Request
+            ? std::optional<RequestPayload>(std::get<RequestPayload>(starting->message().payload())) : std::nullopt;
+        endgame_test::reservations(f.swarm, f.state(), sending);
         if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
             start && start->details().sender == 1 && start->details().messageType == MessageType::Request) {
             const auto block = std::get<RequestPayload>(start->message().payload());
             if (started.empty()) check(block.index == 2);
-            for (const auto& earlier : started) if (earlier.index == block.index)
-                check(block.begin >= earlier.begin + earlier.length || earlier.begin >= block.begin + block.length);
-            started.push_back(block);
+            for (const auto& [remote, earlier] : started)
+                endgame_test::checkOverlap(f.swarm, f.state(), start->details().receiver, block, remote, earlier);
+            started.emplace_back(start->details().receiver, block);
             usedThree |= start->details().receiver == 3;
             usedFour |= start->details().receiver == 4;
         }
@@ -2697,20 +2711,20 @@ void schedulerSkipsReceivedAndOutstandingAcrossPeers()
     f.network.deliver(2, 1, 2, Message(MessageType::Bitfield, BitfieldPayload{{0xc0}}));
     f.network.deliver(2, 1, 2, Message(MessageType::Unchoke));
     check(f.connection(2).scheduledRequests.front() == RequestPayload{0, 0, 16384});
-    std::vector<RequestPayload> requested{explicitBlock};
+    std::vector<std::pair<PeerId, RequestPayload>> requested{{3, explicitBlock}};
     f.simulation.setEventObserver([&](const Event& event) {
         const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
         if (!start || start->details().messageType != MessageType::Request || start->details().sender != 2) return;
         const auto& block = std::get<RequestPayload>(start->message().payload());
         if (start->details().swarmId != 1) return;
-        for (const auto& earlier : requested) {
-            if (earlier.index == block.index) check(block.begin >= earlier.begin + earlier.length || earlier.begin >= block.begin + block.length);
-        }
+        endgame_test::reservations(f.swarm, state, block);
+        for (const auto& [remote, earlier] : requested)
+            endgame_test::checkOverlap(f.swarm, state, start->details().receiver, block, remote, earlier);
         if (block.index == 0) {
             check(block.begin >= 1024);
             check(block.begin >= 4096 || block.begin + block.length <= 2048);
         }
-        requested.push_back(block);
+        requested.emplace_back(start->details().receiver, block);
         for (const auto& [remote, connection] : f.network.peer(2).swarmState(1).connections) {
             check(connection.outgoingRequests.size() + connection.scheduledRequests.size() <= 5);
         }
@@ -2860,9 +2874,8 @@ void invalidHandshake(bool wrongHash)
         check(!f.state().connections.contains(1));
         checkUnchanged(f.network.peer(2).swarmState(2), otherBefore);
     }
-    // The existing CANCEL no-op creates a default connection, allowing us
-    // to check an existing incomplete connection without adding protocol behavior.
-    f.deliver(Message(MessageType::Cancel, CancelPayload{}));
+    // Create an incomplete connection directly; CANCEL now requires a handshake.
+    addIncompleteConnection(f.network, f.swarm, 2, 1);
     check(!f.state().connections.at(1).handshakeComplete());
     auto payload = HandshakePayload{f.swarm.infoHash(), f.sender.protocolId()};
     if (wrongHash) payload.infoHash.back() ^= 1;
@@ -2887,7 +2900,7 @@ void ordinaryMessagesRequireHandshake()
         Message(MessageType::Bitfield, BitfieldPayload{{0x01, 0x80}})
     };
     for (bool existingConnection : {false, true}) {
-        if (existingConnection) f.deliver(Message(MessageType::Cancel, CancelPayload{}));
+        if (existingConnection) addIncompleteConnection(f.network, f.swarm, 2, 1);
         const auto before = f.state();
         for (const auto& message : messages) {
             rejects([&] { f.deliver(message); });

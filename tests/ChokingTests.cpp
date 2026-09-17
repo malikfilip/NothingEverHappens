@@ -188,7 +188,7 @@ void usefulOnly() {
     f.at(1, [&] {
         check(f.state().connections.at(2).downloadedInWindow == 100);
         f.payload(3, 1, 50, 100); // Only 50 new useful bytes.
-        f.network.send(1, 2, 1, Message(MessageType::Cancel, CancelPayload{}));
+        f.network.send(1, 2, 1, Message(MessageType::Cancel, CancelPayload{0, 0, 1}));
     });
     f.at(2, [&] {
         check(f.state().connections.at(3).downloadedInWindow == 50);

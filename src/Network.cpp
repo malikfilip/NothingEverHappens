@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include <tuple>
 
 #include "simulator/MessageArrivalEvent.hpp"
 #include "simulator/SendMessageEvent.hpp"
@@ -85,7 +86,7 @@ namespace simulator {
             if (c != connections.end() && c->second.handshakeComplete()
                 && peer(sender).hasSwarm(swarmId)) {
                 auto& remote = peers_[peer_transport_.at(sender).peerIndex].swarm_states_.at(swarmId).connections.at(receiver);
-                if (c->second.weAreChokingRemote || remote.remoteIsChokingUs) {
+                if (c->second.weAreChokingRemote) {
                     std::erase(remote.outgoingRequests, std::get<RequestPayload>(message.payload()));
                     return;
                 }
@@ -97,6 +98,16 @@ namespace simulator {
             if (connections.contains(sender)) acceptedBefore = connections.at(sender).acceptedRequests.size();
         }
         bool pieceWasOwned = false;
+        bool retiredPiece = false;
+        if (message.type() == MessageType::Piece && to->hasSwarm(swarmId)) {
+            const auto& p = std::get<PiecePayload>(message.payload());
+            const auto& connections = to->swarmState(swarmId).connections;
+            if (const auto c = connections.find(sender); c != connections.end()) {
+                const auto& retired = c->second.retiredRequests;
+                retiredPiece = std::find(retired.begin(), retired.end(),
+                    RequestPayload{p.index, p.begin, p.length}) != retired.end();
+            }
+        }
         std::uint64_t usefulBytes = 0;
         if (message.type() == MessageType::Piece && to->hasSwarm(swarmId)) {
             const auto& payload = std::get<PiecePayload>(message.payload());
@@ -106,7 +117,7 @@ namespace simulator {
                     & (0x80u >> (index % 8))) != 0;
             }
         }
-        if (message.type() == MessageType::Piece && !pieceWasOwned) {
+        if (message.type() == MessageType::Piece && !pieceWasOwned && !retiredPiece) {
             const auto& payload = std::get<PiecePayload>(message.payload());
             usefulBytes = payload.length;
             const auto& ranges = to->swarmState(swarmId).receivedBlocks;
@@ -120,6 +131,16 @@ namespace simulator {
         }
         to->receiveMessage(currentSwarm, sender, message, senderProtocolId,
             (message.type() == MessageType::Request || message.type() == MessageType::Piece) ? &peer(sender) : nullptr);
+        if (message.type() == MessageType::Cancel) {
+            const auto& cancel = std::get<CancelPayload>(message.payload());
+            const RequestPayload block{cancel.index, cancel.begin, cancel.length};
+            const auto& committed = to->swarmState(swarmId).connections.at(sender).committedRequests;
+            if (std::find(committed.begin(), committed.end(), block) == committed.end()) {
+                auto& connections = peers_[peer_transport_.at(sender).peerIndex].swarm_states_.at(swarmId).connections;
+                if (auto c = connections.find(receiver); c != connections.end())
+                    std::erase(c->second.retiredRequests, block);
+            }
+        }
         if (message.type() == MessageType::Request
             && to->swarmState(swarmId).connections.at(sender).acceptedRequests.size() != acceptedBefore) {
             const auto& request = std::get<RequestPayload>(message.payload());
@@ -131,9 +152,26 @@ namespace simulator {
             const auto& piece = std::get<PiecePayload>(message.payload());
             const auto from = std::find_if(peers_.begin(), peers_.end(),
                 [sender](const Peer& candidate) { return candidate.id() == sender; });
+            const RequestPayload block{piece.index, piece.begin, piece.length};
+            auto& provider = from->swarm_states_.at(swarmId).connections.at(receiver);
+            std::erase(provider.acceptedRequests, block);
+            std::erase(provider.committedRequests, block);
+            if (retiredPiece) return; // Expected late wire traffic, never useful payload.
             recordUsefulPiece(sender, receiver, swarmId, usefulBytes);
-            std::erase(from->swarm_states_.at(swarmId).connections.at(receiver).acceptedRequests,
-                RequestPayload{piece.index, piece.begin, piece.length});
+            std::vector<PeerId> duplicates;
+            for (auto& [remote, connection] : to->swarm_states_.at(swarmId).connections) {
+                std::erase(connection.scheduledRequests, block);
+                if (remote != sender && std::erase(connection.outgoingRequests, block)) {
+                    connection.retiredRequests.push_back(block);
+                    duplicates.push_back(remote);
+                }
+            }
+            std::sort(duplicates.begin(), duplicates.end());
+            for (const auto remote : duplicates) {
+                simulation_.schedule(std::make_unique<SendMessageEvent>(
+                    simulation_.currentTime(), *this, swarmId, receiver, remote,
+                    Message(MessageType::Cancel, CancelPayload{block.index, block.begin, block.length})));
+            }
             const auto& state = to->swarmState(swarmId);
             if (!pieceWasOwned && (state.localBitfield[piece.index / 8]
                 & (0x80u >> (piece.index % 8))) != 0) {
@@ -209,7 +247,8 @@ namespace simulator {
     }
 
     std::optional<RequestPayload> Network::nextRequestBlock(const Swarm& swarm,
-        const PeerSwarmState& state, std::uint32_t piece, std::uint32_t begin)
+        const PeerSwarmState& state, std::uint32_t piece, std::uint32_t begin,
+        const std::vector<RequestPayload>* retiredAtTarget)
     {
         const auto size = swarm.pieceSize(piece);
         std::vector<BlockRange> occupied;
@@ -224,6 +263,10 @@ namespace simulator {
                 }
             }
         }
+        // Avoid reusing a canceled response identity on this target only. These
+        // ranges are NOT reservations for other providers or endgame eligibility.
+        if (retiredAtTarget) for (const auto& request : *retiredAtTarget)
+            if (request.index == piece) occupied.push_back({request.begin, request.begin + request.length});
         std::sort(occupied.begin(), occupied.end(), [](const auto& a, const auto& b) {
             return a.begin < b.begin;
         });
@@ -249,7 +292,7 @@ namespace simulator {
             if ((state.localBitfield[piece / 8] & mask) != 0
                 || (connection.remoteBitfield[piece / 8] & mask) == 0
                 || (remoteState.localBitfield[piece / 8] & mask) == 0
-                || !nextRequestBlock(swarm, state, piece)) continue;
+                || !nextRequestBlock(swarm, state, piece, 0, &connection.retiredRequests)) continue;
 
             // Rarity uses only this requester's knowledge, including choked remotes.
             // The target's actual inventory above remains an eligibility safeguard.
@@ -271,23 +314,74 @@ namespace simulator {
         if (!requester.isActiveInSwarm(swarmId) || !peer(remotePeerId).isActiveInSwarm(swarmId)) return;
         const auto& currentSwarm = swarm(swarmId);
         if (currentSwarm.pieceLength() == 0 || !requester.hasSwarm(swarmId)) return;
-        const auto& remote = peer(remotePeerId);
-        if (!remote.hasSwarm(swarmId)) return;
         auto& state = requester.swarm_states_.at(swarmId);
-        const auto found = state.connections.find(remotePeerId);
-        if (found == state.connections.end()) return;
-        auto& connection = found->second;
-        if (!connection.handshakeComplete() || !connection.weAreInterestedInRemote
-            || connection.remoteIsChokingUs) return;
-        while (connection.outgoingRequests.size() + connection.scheduledRequests.size() < requestPipelineDepth) {
-            const auto piece = selectPiece(currentSwarm, state, connection, remote.swarmState(swarmId));
-            if (!piece) break;
-            const auto block = *nextRequestBlock(currentSwarm, state, *piece);
-            connection.scheduledRequests.push_back(block);
-            simulation_.schedule(std::make_unique<SendMessageEvent>(
-                simulation_.currentTime(), *this, swarmId, requester.id(), remotePeerId,
-                Message(MessageType::Request, block), true));
+        auto fill = [&](PeerId target) {
+            if (!peer(target).isActiveInSwarm(swarmId)) return;
+            const auto found = state.connections.find(target);
+            if (found == state.connections.end()) return;
+            auto& connection = found->second;
+            if (!connection.handshakeComplete() || !connection.weAreInterestedInRemote
+                || connection.remoteIsChokingUs) return;
+            const auto& remoteState = peer(target).swarmState(swarmId);
+            while (connection.outgoingRequests.size() + connection.scheduledRequests.size() < requestPipelineDepth) {
+                const auto piece = selectPiece(currentSwarm, state, connection, remoteState);
+                auto block = piece ? nextRequestBlock(currentSwarm, state, *piece, 0, &connection.retiredRequests)
+                    : endgameBlock(currentSwarm, state, target);
+                if (!block) break;
+                if ((remoteState.localBitfield[block->index / 8] & (0x80u >> (block->index % 8))) == 0) break;
+                connection.scheduledRequests.push_back(*block);
+                simulation_.schedule(std::make_unique<SendMessageEvent>(
+                    simulation_.currentTime(), *this, swarmId, requester.id(), target,
+                    Message(MessageType::Request, *block), true));
+            }
+        };
+        fill(remotePeerId);
+        // Revisit previously idle neighbors when the last normal gap is reserved.
+        if (endgameReady(currentSwarm, state)) {
+            std::vector<PeerId> remotes;
+            for (const auto& [remote, connection] : state.connections) remotes.push_back(remote);
+            std::sort(remotes.begin(), remotes.end());
+            for (const auto remote : remotes) if (remote != remotePeerId) fill(remote);
         }
+    }
+
+    bool Network::endgameReady(const Swarm& swarm, const PeerSwarmState& state)
+    {
+        bool incomplete = false;
+        for (std::uint32_t piece = 0; piece < swarm.pieceCount(); ++piece) {
+            if ((state.localBitfield[piece / 8] & (0x80u >> (piece % 8))) != 0) continue;
+            incomplete = true;
+            if (nextRequestBlock(swarm, state, piece)) return false;
+        }
+        return incomplete;
+    }
+
+    std::optional<RequestPayload> Network::endgameBlock(const Swarm& swarm,
+        const PeerSwarmState& state, PeerId remote)
+    {
+        if (!endgameReady(swarm, state)) return std::nullopt;
+        const auto& target = state.connections.at(remote);
+        std::optional<RequestPayload> selected;
+        for (const auto& [source, connection] : state.connections) {
+            if (source == remote) continue;
+            for (const auto* requests : {&connection.scheduledRequests, &connection.outgoingRequests}) {
+                for (const auto& block : *requests) {
+                    const auto mask = 0x80u >> (block.index % 8);
+                    if ((state.localBitfield[block.index / 8] & mask)
+                        || !(target.remoteBitfield[block.index / 8] & mask)) continue;
+                    bool unavailable = false;
+                    for (const auto* own : {&target.scheduledRequests, &target.outgoingRequests, &target.retiredRequests})
+                        unavailable |= std::find(own->begin(), own->end(), block) != own->end();
+                    if (const auto ranges = state.receivedBlocks.find(block.index); ranges != state.receivedBlocks.end())
+                        for (const auto& range : ranges->second)
+                            unavailable |= range.begin < block.begin + block.length && block.begin < range.end;
+                    if (unavailable) continue;
+                    if (!selected || std::tie(block.index, block.begin, block.length)
+                        < std::tie(selected->index, selected->begin, selected->length)) selected = block;
+                }
+            }
+        }
+        return selected;
     }
 
     void Network::sendScheduledPiece(SwarmId swarmId, PeerId sender, PeerId receiver, Message message, LifecycleContext context)
@@ -296,12 +390,16 @@ namespace simulator {
         auto& from = peers_[peer_transport_.at(sender).peerIndex];
         auto& state = from.swarm_states_.at(swarmId);
         auto& connection = state.connections.at(receiver);
+        const auto& piece = std::get<PiecePayload>(message.payload());
+        const RequestPayload block{piece.index, piece.begin, piece.length};
+        if (std::find(connection.acceptedRequests.begin(), connection.acceptedRequests.end(), block)
+            == connection.acceptedRequests.end()) return; // Canceled before transport handoff.
         if (state.choking.managed && connection.weAreChokingRemote) {
-            const auto& piece = std::get<PiecePayload>(message.payload());
-            const RequestPayload block{piece.index, piece.begin, piece.length};
             std::erase(connection.acceptedRequests, block);
             std::erase(peers_[peer_transport_.at(receiver).peerIndex].swarm_states_.at(swarmId)
                 .connections.at(sender).outgoingRequests, block);
+            std::erase(peers_[peer_transport_.at(receiver).peerIndex].swarm_states_.at(swarmId)
+                .connections.at(sender).retiredRequests, block);
             return;
         }
         send(swarmId, sender, receiver, std::move(message), context);
@@ -328,7 +426,8 @@ namespace simulator {
             tryScheduleRequests(*from, swarmId, receiver);
             return;
         }
-        if (nextRequestBlock(swarm(swarmId), state, block.index, block.begin) != block) {
+        if (nextRequestBlock(swarm(swarmId), state, block.index, block.begin, &connection.retiredRequests) != block
+            && endgameBlock(swarm(swarmId), state, receiver) != block) {
             tryScheduleRequests(*from, swarmId, receiver);
             return;
         }
@@ -386,8 +485,28 @@ namespace simulator {
         if (message.type() == MessageType::Request) {
             const auto& request = std::get<RequestPayload>(message.payload());
             from.validateRequestTo(swarm(swarmId), to, request);
-            const auto& pending = from.swarmState(swarmId).connections.at(receiver).outgoingRequests;
-            if (std::find(pending.begin(), pending.end(), request) != pending.end()) return;
+            const auto& connection = from.swarmState(swarmId).connections.at(receiver);
+            for (const auto* pending : {&connection.outgoingRequests, &connection.retiredRequests})
+                if (std::find(pending->begin(), pending->end(), request) != pending->end()) return;
+        }
+        if (message.type() == MessageType::Cancel) {
+            if (!from.isActiveInSwarm(swarmId) || !to.isActiveInSwarm(swarmId))
+                throw std::invalid_argument("CANCEL peers must share the swarm");
+            const auto& connections = from.swarmState(swarmId).connections;
+            const auto connection = connections.find(receiver);
+            if (connection == connections.end() || !connection->second.handshakeComplete())
+                throw std::invalid_argument("CANCEL requires a completed handshake");
+            const auto& cancel = std::get<CancelPayload>(message.payload());
+            const RequestPayload block{cancel.index, cancel.begin, cancel.length};
+            Peer::validateBlock(swarm(swarmId), block);
+            auto& local = peers_[peer_transport_.at(sender).peerIndex].swarm_states_.at(swarmId).connections.at(receiver);
+            // Only this remote's exact outstanding request is canceled. Unmatched
+            // control traffic must not create permission for unsolicited PIECEs.
+            if (std::erase(local.outgoingRequests, block)) {
+                if (std::find(local.retiredRequests.begin(), local.retiredRequests.end(), block)
+                    == local.retiredRequests.end()) local.retiredRequests.push_back(block);
+                std::erase(local.scheduledRequests, block);
+            }
         }
         if (message.type() == MessageType::Piece) {
             from.validatePieceTo(swarm(swarmId), to, std::get<PiecePayload>(message.payload()));
@@ -396,6 +515,13 @@ namespace simulator {
             ? std::optional<RequestPayload>(std::get<RequestPayload>(message.payload())) : std::nullopt;
         auto& link = links_[index];
         auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
+        if (message.type() == MessageType::Piece) {
+            const auto& piece = std::get<PiecePayload>(message.payload());
+            auto& committed = peers_[peer_transport_.at(sender).peerIndex].swarm_states_.at(swarmId)
+                .connections.at(receiver).committedRequests;
+            const RequestPayload block{piece.index, piece.begin, piece.length};
+            if (std::find(committed.begin(), committed.end(), block) == committed.end()) committed.push_back(block);
+        }
         direction.pending.push_back({swarmId, sender, receiver, std::move(message), lifecycle});
         if (!direction.active) {
             startTransmission(index, sender);

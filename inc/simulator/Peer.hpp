@@ -32,6 +32,11 @@ namespace simulator {
         // Reserved by automatic scheduling until the SendMessageEvent executes.
         std::vector<RequestPayload> scheduledRequests;
 
+        // Sent downloads canceled locally or superseded by a winner; never reserve capacity.
+        std::vector<RequestPayload> retiredRequests;
+        // Accepted responses already handed to Network (including FIFO/propagation).
+        std::vector<RequestPayload> committedRequests;
+
         // Current and previous globally aligned 10-second buckets.
         std::uint64_t downloadedInWindow = 0;
         std::uint64_t uploadedInWindow = 0;

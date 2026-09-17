@@ -1,3 +1,4 @@
+#include "EndgameAssertions.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -65,7 +66,7 @@ void autonomousFourPeerRing(bool tracing)
         unsigned starts = 0, completions = 0, delivered = 0;
     };
     std::array<std::array<Direction, 5>, 5> directions;
-    std::array<std::vector<RequestPayload>, 5> requestHistory;
+    std::array<std::vector<std::pair<PeerId, RequestPayload>>, 5> requestHistory;
     std::array<std::array<bool, 5>, 5> usedRemote{};
     std::array<std::array<std::size_t, 5>, 5> maxPending{};
     std::array<std::array<std::uint8_t, 5>, 5> learnedFromHave{};
@@ -75,7 +76,28 @@ void autonomousFourPeerRing(bool tracing)
     unsigned haveInterestGains = 0;
     bool independentLinks = false, fullDuplex = false;
 
+    struct PendingSend { PeerId sender, receiver; Enqueued message; std::size_t queuedBefore; };
+    std::optional<PendingSend> pendingSend;
+    auto finishSend = [&](const Event* next) {
+        if (!pendingSend) return;
+        const auto pending = *pendingSend;
+        pendingSend.reset();
+        const auto* start = dynamic_cast<const TransmissionStartEvent*>(next);
+        const bool immediate = start && start->details().sender == pending.sender
+            && start->details().receiver == pending.receiver;
+        const auto count = network.transmissionState(pending.sender, pending.receiver).pendingCount;
+        require(immediate || count == pending.queuedBefore || count == pending.queuedBefore + 1,
+            "Unexpected FIFO change during send");
+        if (immediate || count == pending.queuedBefore + 1) {
+            auto& direction = directions[pending.sender][pending.receiver];
+            direction.queued.push_back(pending.message);
+            ++direction.sends[static_cast<int>(pending.message.type) + 1];
+        }
+    };
     simulation.setEventObserver([&](const Event& event) {
+        // Observers run BEFORE execution. Confirm enqueue at the next callback,
+        // or at the nested immediate start; canceled send events enqueue nothing.
+        finishSend(&event);
         std::array<double, 5> outgoing{}, incoming{};
         for (const auto& [id, active] : network.activeTransmissions()) {
             outgoing[active.sender] += active.currentRate;
@@ -88,21 +110,23 @@ void autonomousFourPeerRing(bool tracing)
         // Inspect actual reservations at every event boundary, not just transmitted requests.
         for (PeerId id = 1; id <= 4; ++id) {
             const auto& state = network.peer(id).swarmState(1);
-            std::vector<RequestPayload> occupied;
+            const auto* starting = dynamic_cast<const TransmissionStartEvent*>(&event);
+            const auto sending = starting && starting->details().sender == id
+                && starting->details().messageType == MessageType::Request
+                ? std::optional<RequestPayload>(std::get<RequestPayload>(starting->message().payload())) : std::nullopt;
+            endgame_test::reservations(swarm, state, sending);
             for (const auto& [remote, connection] : state.connections) {
                 const auto pending = connection.scheduledRequests.size() + connection.outgoingRequests.size();
                 require(pending <= 5, "Per-connection pipeline exceeded depth five");
                 maxPending[id][remote] = std::max(maxPending[id][remote], pending);
                 for (const auto* requests : {&connection.scheduledRequests, &connection.outgoingRequests}) {
                     for (const auto& request : *requests) {
-                        for (const auto& earlier : occupied) require(!overlaps(request, earlier), "Reservations overlap across remotes");
                         if (const auto received = state.receivedBlocks.find(request.index); received != state.receivedBlocks.end()) {
                             for (const auto& range : received->second) {
                                 require(!overlaps(request, {request.index, range.begin, range.end - range.begin}),
                                     "Request overlaps already received data");
                             }
                         }
-                        occupied.push_back(request);
                     }
                 }
             }
@@ -110,9 +134,8 @@ void autonomousFourPeerRing(bool tracing)
         if (const auto* send = dynamic_cast<const SendMessageEvent*>(&event)) {
             const auto details = send->details();
             require(details.swarmId == 1, "Message escaped the integration swarm");
-            auto& direction = directions[details.sender][details.receiver];
-            direction.queued.push_back({details.messageType, event.time()});
-            ++direction.sends[static_cast<int>(details.messageType) + 1];
+            pendingSend = PendingSend{details.sender, details.receiver, {details.messageType, event.time()},
+                network.transmissionState(details.sender, details.receiver).pendingCount};
             if (details.messageType == MessageType::Interested && interestGainArmed[details.sender][details.receiver]) {
                 require(network.peer(details.sender).swarmState(1).connections.at(details.receiver).weAreInterestedInRemote,
                     "HAVE did not make the new source interesting");
@@ -134,15 +157,15 @@ void autonomousFourPeerRing(bool tracing)
                 const auto block = std::get<RequestPayload>(message.payload());
                 require(block.length > 0 && block.length <= 16384 && block.begin + block.length <= swarm.pieceSize(block.index),
                     "Automatic request has invalid block bounds");
-                for (const auto& earlier : requestHistory[details.sender]) {
-                    require(!overlaps(block, earlier), "A peer requested duplicate bytes, possibly from another remote");
-                }
+                for (const auto& [remote, earlier] : requestHistory[details.sender])
+                    endgame_test::checkOverlap(swarm, network.peer(details.sender).swarmState(1),
+                        details.receiver, block, remote, earlier);
                 require((initial[details.sender] & (0x80u >> block.index)) == 0, "Requested an initially owned piece");
                 if ((initial[details.receiver] & (0x80u >> block.index)) == 0) {
                     require((learnedFromHave[details.sender][details.receiver] & (0x80u >> block.index)) != 0,
                         "Requested a relayed piece before learning availability through HAVE");
                 }
-                requestHistory[details.sender].push_back(block);
+                requestHistory[details.sender].emplace_back(details.receiver, block);
                 usedRemote[details.sender][details.receiver] = true;
             }
             if (message.type() == MessageType::Piece) {
@@ -214,6 +237,7 @@ void autonomousFourPeerRing(bool tracing)
             Message(MessageType::Handshake, HandshakePayload{swarm.infoHash(), peers[sender - 1].protocolId()})));
     }
     simulation.run();
+    finishSend(nullptr);
     require(independentLinks && fullDuplex, "Scenario did not exercise independent links and full duplex");
     require(concurrentReception[2] && concurrentReception[4], "Leechers did not receive concurrent PIECE transfers from multiple sources");
     require(relayedBlocks[2] > 0 && relayedBlocks[4] > 0 && haveInterestGains >= 2,
@@ -229,14 +253,21 @@ void autonomousFourPeerRing(bool tracing)
                 require(state.receivedBlocks.at(piece) == std::vector<BlockRange>{{0, swarm.pieceSize(piece)}}, "Incomplete merged piece coverage");
             }
         }
-        for (const auto& block : requestHistory[id]) requestedBytes += block.length;
+        std::vector<RequestPayload> unique;
+        for (const auto& [remote, block] : requestHistory[id]) {
+            if (std::find(unique.begin(), unique.end(), block) == unique.end()) {
+                unique.push_back(block);
+                requestedBytes += block.length;
+            }
+        }
         require(requestedBytes == expectedBytes, "Requested byte coverage differs from initially missing data");
         unsigned sources = 0;
         for (const auto& [remote, connection] : state.connections) {
             sources += usedRemote[id][remote];
             require(connection.handshakeComplete() && connection.bitfieldSent, "Handshake/bitfield flow incomplete");
             require(connection.remoteBitfield == state.localBitfield, "Final remote availability is stale");
-            require(connection.scheduledRequests.empty() && connection.outgoingRequests.empty() && connection.acceptedRequests.empty(),
+            require(connection.scheduledRequests.empty() && connection.outgoingRequests.empty() && connection.acceptedRequests.empty()
+                && connection.retiredRequests.empty() && connection.committedRequests.empty(),
                 "Requests remain after swarm completion");
             require(!connection.weAreInterestedInRemote && !connection.remoteInterestedInUs
                 && connection.weAreChokingRemote && connection.remoteIsChokingUs, "Final interest/choke state is inconsistent");

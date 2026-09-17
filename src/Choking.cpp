@@ -110,7 +110,9 @@ void Network::setChoking(PeerId local, SwarmId swarmId, PeerId remote, bool chok
             const auto& piece = std::get<PiecePayload>(queued.message.payload());
             const RequestPayload block{piece.index, piece.begin, piece.length};
             std::erase(connection.acceptedRequests, block);
+            std::erase(connection.committedRequests, block);
             std::erase(requester.outgoingRequests, block);
+            std::erase(requester.retiredRequests, block);
             return true;
         });
     }

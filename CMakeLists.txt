@@ -81,3 +81,11 @@ if(BUILD_TESTING)
     target_include_directories(peer_lifecycle_tests PRIVATE inc)
     add_test(NAME peer_lifecycle COMMAND peer_lifecycle_tests)
 endif()
+
+if(BUILD_TESTING)
+    add_executable(endgame_tests tests/EndgameTests.cpp src/Simulation.cpp src/Peer.cpp
+        src/Link.cpp src/Message.cpp src/Swarm.cpp src/Network.cpp src/Choking.cpp
+        src/Tracker.cpp src/PeerDiscovery.cpp src/PeerLifecycle.cpp)
+    target_include_directories(endgame_tests PRIVATE inc)
+    add_test(NAME endgame COMMAND endgame_tests)
+endif()

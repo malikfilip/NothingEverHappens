@@ -94,8 +94,10 @@ namespace simulator {
         }
         const auto& accepted = connection->second.acceptedRequests;
         const auto& outgoing = requester->second.outgoingRequests;
+        const auto& retired = requester->second.retiredRequests;
+        const bool late = std::find(retired.begin(), retired.end(), block) != retired.end();
         if (std::find(accepted.begin(), accepted.end(), block) == accepted.end()
-            || std::find(outgoing.begin(), outgoing.end(), block) == outgoing.end()) {
+            || (std::find(outgoing.begin(), outgoing.end(), block) == outgoing.end() && !late)) {
             throw std::invalid_argument("PIECE must answer an accepted outstanding request");
         }
     }
@@ -145,7 +147,8 @@ namespace simulator {
         case MessageType::Interested:
         case MessageType::NotInterested:
         case MessageType::Have:
-        case MessageType::Bitfield: {
+        case MessageType::Bitfield:
+        case MessageType::Cancel: {
             const auto connection = state->second.connections.find(sender);
             if (connection == state->second.connections.end() || !connection->second.handshakeComplete()) {
                 throw std::invalid_argument("Peer-wire message requires a completed handshake");
@@ -170,11 +173,22 @@ namespace simulator {
             }
         }
 
+        if (message.type() == MessageType::Cancel) {
+            const auto& cancel = std::get<CancelPayload>(message.payload());
+            validateBlock(swarm, {cancel.index, cancel.begin, cancel.length});
+        }
         if (message.type() == MessageType::Request) {
             if (!senderPeer || senderPeer->id() != sender) {
                 throw std::invalid_argument("REQUEST requires actual sender context");
             }
-            senderPeer->validateRequestTo(swarm, *this, std::get<RequestPayload>(message.payload()));
+            // Arrival eligibility belongs to the provider. The requester may have
+            // completed or canceled this block while the REQUEST was on the wire.
+            const auto& request = std::get<RequestPayload>(message.payload());
+            validateBlock(swarm, request);
+            if (!senderPeer->isActiveInSwarm(swarm.id())
+                || !(state->second.localBitfield[request.index / 8] & (0x80u >> (request.index % 8)))) {
+                throw std::invalid_argument("REQUEST requires an active sender and local ownership");
+            }
             const auto connection = state->second.connections.find(sender);
             if (connection == state->second.connections.end() || !connection->second.handshakeComplete()
                 || !connection->second.remoteInterestedInUs || connection->second.weAreChokingRemote) {
@@ -197,7 +211,9 @@ namespace simulator {
                 throw std::invalid_argument("PIECE requires an established sender connection");
             }
             const auto& pending = connection->second.outgoingRequests;
-            if (std::find(pending.begin(), pending.end(), block) == pending.end()) {
+            const auto& retired = connection->second.retiredRequests;
+            if (std::find(pending.begin(), pending.end(), block) == pending.end()
+                && std::find(retired.begin(), retired.end(), block) == retired.end()) {
                 throw std::invalid_argument("Unsolicited or mismatched PIECE");
             }
         }
@@ -244,6 +260,7 @@ namespace simulator {
         case MessageType::Piece: {
             const auto& piece = std::get<PiecePayload>(message.payload());
             const RequestPayload block{piece.index, piece.begin, piece.length};
+            if (std::erase(remote.retiredRequests, block) != 0) return;
             auto& ranges = state->second.receivedBlocks[piece.index];
             ranges.push_back({piece.begin, piece.begin + piece.length});
             std::sort(ranges.begin(), ranges.end(), [](const BlockRange& a, const BlockRange& b) {
@@ -263,9 +280,13 @@ namespace simulator {
             std::erase(remote.outgoingRequests, block);
             break;
         }
-        case MessageType::Cancel:
-            // Protocol handling is not implemented yet.
+        case MessageType::Cancel: {
+            const auto& cancel = std::get<CancelPayload>(message.payload());
+            const RequestPayload block{cancel.index, cancel.begin, cancel.length};
+            if (std::find(remote.committedRequests.begin(), remote.committedRequests.end(), block)
+                == remote.committedRequests.end()) std::erase(remote.acceptedRequests, block);
             break;
+        }
         }
         if (message.type() == MessageType::Bitfield || message.type() == MessageType::Have) {
             remote.weAreInterestedInRemote = hasUsefulPieces(swarm, state->second, remote);
