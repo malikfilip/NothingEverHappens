@@ -41,7 +41,7 @@ bool Network::hasUsefulExchange(PeerId local, SwarmId swarmId) const
     if (swarm(swarmId).totalSize() == 0) return false; // Protocol-only swarms have no transferable payload.
     const auto& state = peer(local).swarmState(swarmId);
     for (const auto& [remote, connection] : state.connections) {
-        if (!connection.handshakeComplete() || !peer(remote).hasSwarm(swarmId)) continue;
+        if (!connection.handshakeComplete() || !peer(remote).isActiveInSwarm(swarmId)) continue;
         const auto& other = peer(remote).swarmState(swarmId);
         for (std::size_t i = 0; i < state.localBitfield.size(); ++i) {
             if (connection.remoteInterestedInUs && (state.localBitfield[i] & ~other.localBitfield[i])) return true;
@@ -53,6 +53,7 @@ bool Network::hasUsefulExchange(PeerId local, SwarmId swarmId) const
 
 void Network::scheduleRechoke(PeerId local, SwarmId swarmId)
 {
+    if (!peer(local).isActiveInSwarm(swarmId)) return;
     auto& policy = peers_[peer_transport_.at(local).peerIndex].swarm_states_.at(swarmId).choking;
     if (policy.eventPending) return;
     policy.managed = true;
@@ -140,6 +141,7 @@ void Network::enforceInterestedLimit(PeerId local, SwarmId swarmId)
 
 void Network::rechoke(PeerId local, SwarmId swarmId)
 {
+    if (!peer(local).isActiveInSwarm(swarmId)) return;
     auto& state = peers_[peer_transport_.at(local).peerIndex].swarm_states_.at(swarmId);
     auto& policy = state.choking;
     policy.eventPending = false;

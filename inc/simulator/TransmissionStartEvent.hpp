@@ -12,9 +12,9 @@ namespace simulator {
     public:
         // Created by Network only when the direction is idle and the FIFO front is ready.
         TransmissionStartEvent(double time, Network& network, SwarmId swarmId,
-                               PeerId sender, PeerId receiver, Message message)
+                               PeerId sender, PeerId receiver, Message message, std::optional<LifecycleContext> context = std::nullopt)
             : Event(time), network_(network),
-              transmission_{swarmId, sender, receiver, std::move(message)} {}
+              transmission_{swarmId, sender, receiver, std::move(message), context ? *context : network.lifecycleContext(swarmId, sender, receiver)} {}
 
         MessageEventDetails details() const
         {

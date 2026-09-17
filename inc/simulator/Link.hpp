@@ -4,6 +4,7 @@
 #include <deque>
 
 #include "simulator/Message.hpp"
+#include "simulator/LifecycleContext.hpp"
 #include "simulator/Peer.hpp"
 #include "simulator/SwarmId.hpp"
 
@@ -14,6 +15,7 @@ namespace simulator {
         PeerId sender;
         PeerId receiver;
         Message message;
+        LifecycleContext lifecycle;
     };
 
     class Link {

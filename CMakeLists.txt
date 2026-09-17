@@ -20,7 +20,7 @@ add_executable(bittorrent_simulator
         inc/simulator/Network.hpp
         src/Network.cpp
         src/Tracker.cpp
-        src/PeerDiscovery.cpp
+        src/PeerDiscovery.cpp src/PeerLifecycle.cpp
         src/Choking.cpp
 )
 
@@ -39,7 +39,7 @@ if(BUILD_TESTING)
         src/Swarm.cpp
         src/Network.cpp
         src/Tracker.cpp
-        src/PeerDiscovery.cpp
+        src/PeerDiscovery.cpp src/PeerLifecycle.cpp
         src/Choking.cpp
     )
     target_include_directories(message_delivery_tests PRIVATE inc)
@@ -53,7 +53,7 @@ if(BUILD_TESTING)
         src/Swarm.cpp
         src/Network.cpp
         src/Tracker.cpp
-        src/PeerDiscovery.cpp
+        src/PeerDiscovery.cpp src/PeerLifecycle.cpp
         src/Choking.cpp
     )
     target_include_directories(multi_peer_integration_tests PRIVATE inc)
@@ -61,7 +61,7 @@ if(BUILD_TESTING)
     add_executable(choking_tests tests/ChokingTests.cpp src/Simulation.cpp src/Peer.cpp
         src/Link.cpp src/Message.cpp src/Swarm.cpp src/Network.cpp
         src/Tracker.cpp
-        src/PeerDiscovery.cpp src/Choking.cpp)
+        src/PeerDiscovery.cpp src/PeerLifecycle.cpp src/Choking.cpp)
     target_include_directories(choking_tests PRIVATE inc)
     add_test(NAME choking COMMAND choking_tests)
 endif()
@@ -69,7 +69,15 @@ endif()
 if(BUILD_TESTING)
     add_executable(tracker_tests tests/TrackerTests.cpp src/Simulation.cpp src/Peer.cpp
         src/Link.cpp src/Message.cpp src/Swarm.cpp src/Network.cpp src/Choking.cpp
-        src/Tracker.cpp src/PeerDiscovery.cpp)
+        src/Tracker.cpp src/PeerDiscovery.cpp src/PeerLifecycle.cpp)
     target_include_directories(tracker_tests PRIVATE inc)
     add_test(NAME tracker COMMAND tracker_tests)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(peer_lifecycle_tests tests/PeerLifecycleTests.cpp src/Simulation.cpp src/Peer.cpp
+        src/Link.cpp src/Message.cpp src/Swarm.cpp src/Network.cpp src/Choking.cpp
+        src/Tracker.cpp src/PeerDiscovery.cpp src/PeerLifecycle.cpp)
+    target_include_directories(peer_lifecycle_tests PRIVATE inc)
+    add_test(NAME peer_lifecycle COMMAND peer_lifecycle_tests)
 endif()

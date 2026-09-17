@@ -118,64 +118,90 @@ void bounded() {
 }
 void reservations() {
     Swarm swarm(1, InfoHash{1}, 1);
-    Simulation simulation;
-    Network network(simulation, peers({swarm}), paths(), {swarm});
-    for (PeerId id = 1; id <= 4; ++id) {
-        network.setMaxNeighbors(1, id, 1);
-    }
-    network.announceToTracker(1, 1, 0);
+    Simulation simulation(false, 7);
+    Network network(simulation, peers({swarm}, 2), paths(2), {swarm});
+    for (PeerId id : {1u, 2u}) network.setTargetOutgoingConnections(1, id, 1);
     unsigned handshakes = 0;
     simulation.setEventObserver([&](const Event& event) {
-        const auto* send = dynamic_cast<const SendMessageEvent*>(&event);
-        if (send && send->details().messageType == MessageType::Handshake) ++handshakes;
+        if (const auto* send = dynamic_cast<const SendMessageEvent*>(&event);
+            send && send->details().messageType == MessageType::Handshake) ++handshakes;
     });
-    network.announceToTracker(1, 2, 1); // Reserves 2--1 before any SendMessageEvent executes.
-    check(network.peer(1).swarmState(1).connections.empty());
-    check(network.peer(2).swarmState(1).connections.empty());
-    rejects([&] { network.setMaxNeighbors(1, 1, 0); });
-    rejects([&] { network.setMaxNeighbors(1, 2, 0); });
-    network.announceToTracker(1, 1, 10); // Reverse attempt, while pending.
-    network.announceToTracker(1, 2, 10); // Duplicate attempt, while pending.
-    network.announceToTracker(1, 3, 10); // Both registered remotes are full; local 3 remains free.
-    network.setMaxNeighbors(1, 3, 0);
-    network.setMaxNeighbors(1, 3, 1);
-    // All announce events precede their generated sends at the same timestamp.
-    for (PeerId id : {3u, 4u, 3u, 4u})
-        simulation.schedule(std::make_unique<TrackerAnnounceEvent>(0, network, 1, id, 10));
+    network.announceToTracker(1, 2, 0);
+    network.announceToTracker(1, 1, 1); // A owns the pending A -> B attempt.
+    rejects([&] { network.setTargetOutgoingConnections(1, 1, 0); });
+    network.announceToTracker(1, 2, 1); // Reverse discovery while pending.
+    network.announceToTracker(1, 1, 1); // Duplicate discovery while pending.
+    network.setTargetOutgoingConnections(1, 2, 0); // Incoming did not acquire ownership.
+    network.setTargetOutgoingConnections(1, 2, 1);
     simulation.run();
-    check(handshakes == 4);
-    for (PeerId id = 1; id <= 4; ++id) check(network.peer(id).swarmState(1).connections.size() == 1);
-    check(network.peer(3).swarmState(1).connections.contains(4));
-    for (PeerId id = 1; id <= 4; ++id) network.announceToTracker(1, id, 10);
+    check(handshakes == 2);
+    for (PeerId id : {1u, 2u}) {
+        const auto& connections = network.peer(id).swarmState(1).connections;
+        check(connections.size() == 1 && connections.at(3 - id).handshakeComplete());
+    }
+    network.announceToTracker(1, 2, 1); // Reverse discovery after establishment.
+    network.announceToTracker(1, 1, 1);
     simulation.run();
-    check(handshakes == 4);
-    rejects([&] { network.setMaxNeighbors(1, 1, 0); });
+    check(handshakes == 2);
+    rejects([&] { network.setTargetOutgoingConnections(1, 1, 0); });
+    network.setTargetOutgoingConnections(1, 2, 0);
 }
 void accumulated() {
     Swarm swarm(1, InfoHash{1}, 1);
-    Simulation simulation;
-    Network network(simulation, peers({swarm}), paths(), {swarm});
-    network.setMaxNeighbors(1, 4, 2);
-    network.announceToTracker(1, 1, 0);
-    network.announceToTracker(1, 4, 1);
-    simulation.run();
-    check(network.peer(4).swarmState(1).connections.size() == 1);
-    network.announceToTracker(1, 2, 0);
+    Simulation simulation(false, 7);
+    // A=1, B=2, C=3, D=4. Only B--A is a usable path for B.
+    Network network(simulation, peers({swarm}),
+        {Link(1, 2, 1000000, .01), Link(1, 3, 1000000, .01), Link(1, 4, 1000000, .01)}, {swarm});
+    network.setTargetOutgoingConnections(1, 1, 2);
+    network.setTargetOutgoingConnections(1, 2, 1);
     network.announceToTracker(1, 3, 0);
-    network.announceToTracker(1, 4, 10);
-    rejects([&] { network.setMaxNeighbors(1, 4, 1); });
+    network.announceToTracker(1, 4, 0);
+    network.announceToTracker(1, 1, 2);
+    rejects([&] { network.setTargetOutgoingConnections(1, 1, 1); });
+    network.announceToTracker(1, 2, 0);
+    network.announceToTracker(1, 1, 3); // Pending ownership prevents oversubscription toward B.
     simulation.run();
-    const auto& connections = network.peer(4).swarmState(1).connections;
-    check(connections.size() == 2 && connections.contains(1));
-    network.announceToTracker(1, 3, 10); // Incoming attempt cannot exceed peer 4's cap.
+    const auto& a = network.peer(1).swarmState(1).connections;
+    check(a.size() == 2 && a.contains(3) && a.contains(4) && !a.contains(2));
+    // A response of three includes A and two unusable candidates; admission remains sparse.
+    network.announceToTracker(1, 2, 3);
+    rejects([&] { network.setTargetOutgoingConnections(1, 2, 0); });
     simulation.run();
-    check(network.peer(4).swarmState(1).connections.size() == 2);
+    check(a.size() == 3);
+    for (PeerId remote : {2u, 3u, 4u}) check(a.at(remote).handshakeComplete());
+    check(network.peer(2).swarmState(1).connections.size() == 1
+        && network.peer(2).swarmState(1).connections.at(1).handshakeComplete());
+    network.setTargetOutgoingConnections(1, 1, 2); // Exactly two owned, despite three neighbors.
+    rejects([&] { network.setTargetOutgoingConnections(1, 1, 1); });
+    network.setTargetOutgoingConnections(1, 2, 1);
+    rejects([&] { network.setTargetOutgoingConnections(1, 2, 0); });
+    network.setTargetOutgoingConnections(1, 3, 0);
+    network.setTargetOutgoingConnections(1, 4, 0);
+}
+void manualHandshakeAccounting() {
+    Swarm swarm(1, InfoHash{1}, 1);
+    Simulation simulation;
+    Network network(simulation, peers({swarm}, 3), paths(3), {swarm});
+    network.setTargetOutgoingConnections(1, 1, 0);
+    simulation.schedule(std::make_unique<SendMessageEvent>(0, network, 1, 1, 2,
+        Message(MessageType::Handshake, HandshakePayload{swarm.infoHash(), network.peer(1).protocolId()})));
+    simulation.run();
+    check(network.peer(1).swarmState(1).connections.at(2).handshakeComplete());
+    network.setTargetOutgoingConnections(1, 1, 0);
+    network.setTargetOutgoingConnections(1, 2, 0);
+    network.setTargetOutgoingConnections(1, 1, 1);
+    network.announceToTracker(1, 3, 0);
+    network.announceToTracker(1, 1, 1);
+    simulation.run();
+    check(network.peer(1).swarmState(1).connections.size() == 2
+        && network.peer(1).swarmState(1).connections.at(3).handshakeComplete());
+    rejects([&] { network.setTargetOutgoingConnections(1, 1, 0); });
 }
 void missingPath() {
     Swarm swarm(1, InfoHash{1}, 1);
     Simulation simulation;
     Network network(simulation, peers({swarm}, 3), {Link(2, 3, 1000000, .01)}, {swarm});
-    network.setMaxNeighbors(1, 3, 1);
+    network.setTargetOutgoingConnections(1, 3, 1);
     network.announceToTracker(1, 1, 0);
     network.announceToTracker(1, 2, 0);
     network.announceToTracker(1, 3, 10); // Only returned peer 2 has a path.
@@ -183,14 +209,14 @@ void missingPath() {
     check(network.peer(1).swarmState(1).connections.empty());
     check(network.peer(3).swarmState(1).connections.size() == 1);
     check(network.peer(3).swarmState(1).connections.contains(2));
-    network.setMaxNeighbors(1, 1, 0); // Missing path never reserved the other endpoint.
+    network.setTargetOutgoingConnections(1, 1, 0); // Missing path never reserved the other endpoint.
 }
 void isolation() {
     Swarm a(1, InfoHash{1}, 1), b(2, InfoHash{2}, 1);
     Simulation simulation;
     Network network(simulation, peers({a, b}, 3), paths(3), {a, b});
-    network.setMaxNeighbors(1, 1, 1);
-    network.setMaxNeighbors(2, 1, 1);
+    network.setTargetOutgoingConnections(1, 1, 1);
+    network.setTargetOutgoingConnections(2, 1, 1);
     network.announceToTracker(1, 2, 0);
     network.announceToTracker(2, 3, 0);
     network.announceToTracker(1, 1, 10);
@@ -209,7 +235,7 @@ void validation() {
     Simulation simulation;
     Network ambiguous(simulation, peers({a, alias}, 2), paths(2), {a, alias});
     rejects([&] { ambiguous.announceToTracker(1, 1, 0); });
-    rejects([&] { ambiguous.setMaxNeighbors(1, 1, 2); });
+    rejects([&] { ambiguous.setTargetOutgoingConnections(1, 1, 2); });
     Peer outsider(3, 1000000, 1000000);
     auto members = peers({a}, 2);
     members.push_back(outsider);
@@ -217,11 +243,17 @@ void validation() {
     rejects([&] { network.announceToTracker(1, 3, 0); });
     rejects([&] { network.announceToTracker(1, 99, 0); });
     rejects([&] { network.announceToTracker(99, 1, 0); });
-    network.setMaxNeighbors(1, 1, 0);
-    network.announceToTracker(1, 1, 0);
-    network.announceToTracker(1, 2, 10);
+    network.setTargetOutgoingConnections(1, 1, 0);
+    network.announceToTracker(1, 2, 0);
+    network.announceToTracker(1, 1, 1); // Zero target does not initiate despite a usable candidate.
     simulation.run();
-    check(network.peer(2).swarmState(1).connections.empty());
+    check(network.peer(1).swarmState(1).connections.empty());
+    network.announceToTracker(1, 2, 1);
+    simulation.run();
+    check(network.peer(1).swarmState(1).connections.at(2).handshakeComplete());
+    check(network.peer(2).swarmState(1).connections.at(1).handshakeComplete());
+    network.setTargetOutgoingConnections(1, 1, 0);
+    rejects([&] { network.setTargetOutgoingConnections(1, 2, 0); });
 }
 void transfer() {
     Swarm swarm(1, InfoHash{1}, 20000, 16384);
@@ -248,11 +280,12 @@ int main() {
         {"Simulation seed controls real tracker discovery", simulationSeed},
         {"Registry bounds, idempotence, self exclusion and hash isolation", registry},
         {"Deterministic bounded discovery and handshake/bitfield", bounded},
-        {"Both endpoint caps, pending reservations, simultaneous/reverse and duplicate discovery", reservations},
-        {"Accumulated established and pending neighbors", accumulated},
+        {"Outgoing ownership survives pending and established reverse/duplicate discovery", reservations},
+        {"Full outgoing target accepts incoming without acquiring ownership", accumulated},
+        {"Manual handshakes do not consume tracker outgoing capacity", manualHandshakeAccounting},
         {"Missing paths skip without reservations", missingPath},
         {"Per-peer/swarm discovery isolation", isolation},
-        {"Membership, ambiguous hashes and zero capacity", validation},
+        {"Membership, ambiguous hashes and zero outgoing target accepts incoming", validation},
         {"Tracker startup completes a small transfer", transfer}
     };
     unsigned failed = 0;

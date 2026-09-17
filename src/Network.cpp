@@ -21,8 +21,8 @@ namespace simulator {
         constexpr std::size_t requestPipelineDepth = 5;
     }
 
-    Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms, std::size_t trackerMaximum)
-        : tracker_(trackerMaximum, simulation.seed()), simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
+    Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms, std::size_t trackerMaximum, double trackerInterval)
+        : tracker_(trackerMaximum, simulation.seed(), trackerInterval), simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
     {
         for (std::size_t i = 0; i < peers_.size(); ++i) {
             peer_transport_.try_emplace(peers_[i].id(), PeerTransport{i, {}, {}});
@@ -59,6 +59,9 @@ namespace simulator {
         if (message.type() == MessageType::Handshake) {
             senderProtocolId = &peer(sender).protocolId();
         }
+        if ((to->hasSwarm(swarmId) && !to->isActiveInSwarm(swarmId))
+            || (peer(sender).hasSwarm(swarmId) && !peer(sender).isActiveInSwarm(swarmId)))
+            throw std::invalid_argument("Inactive swarm membership");
         const auto& currentSwarm = swarm(swarmId);
         const bool availability = message.type() == MessageType::Bitfield || message.type() == MessageType::Have;
         const bool interestMessage = message.type() == MessageType::Interested
@@ -265,6 +268,7 @@ namespace simulator {
 
     void Network::tryScheduleRequests(Peer& requester, SwarmId swarmId, PeerId remotePeerId)
     {
+        if (!requester.isActiveInSwarm(swarmId) || !peer(remotePeerId).isActiveInSwarm(swarmId)) return;
         const auto& currentSwarm = swarm(swarmId);
         if (currentSwarm.pieceLength() == 0 || !requester.hasSwarm(swarmId)) return;
         const auto& remote = peer(remotePeerId);
@@ -286,8 +290,9 @@ namespace simulator {
         }
     }
 
-    void Network::sendScheduledPiece(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
+    void Network::sendScheduledPiece(SwarmId swarmId, PeerId sender, PeerId receiver, Message message, LifecycleContext context)
     {
+        if (messageStale(swarmId, sender, receiver, context)) return;
         auto& from = peers_[peer_transport_.at(sender).peerIndex];
         auto& state = from.swarm_states_.at(swarmId);
         auto& connection = state.connections.at(receiver);
@@ -299,11 +304,12 @@ namespace simulator {
                 .connections.at(sender).outgoingRequests, block);
             return;
         }
-        send(swarmId, sender, receiver, std::move(message));
+        send(swarmId, sender, receiver, std::move(message), context);
     }
 
-    void Network::sendScheduledRequest(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
+    void Network::sendScheduledRequest(SwarmId swarmId, PeerId sender, PeerId receiver, Message message, LifecycleContext context)
     {
+        if (messageStale(swarmId, sender, receiver, context)) return;
         const auto from = std::find_if(peers_.begin(), peers_.end(),
             [sender](const Peer& candidate) { return candidate.id() == sender; });
         const auto& block = std::get<RequestPayload>(message.payload());
@@ -326,7 +332,7 @@ namespace simulator {
             tryScheduleRequests(*from, swarmId, receiver);
             return;
         }
-        send(swarmId, sender, receiver, std::move(message));
+        send(swarmId, sender, receiver, std::move(message), context);
     }
 
     void Network::sendInitialBitfield(Peer& sender, SwarmId swarmId, PeerId receiver)
@@ -361,10 +367,15 @@ namespace simulator {
         return {direction.active, direction.pending.size()};
     }
 
-    void Network::send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message)
+    void Network::send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message, std::optional<LifecycleContext> context)
     {
+        const auto lifecycle = context ? *context : lifecycleContext(swarmId, sender, receiver);
+        if (context && messageStale(swarmId, sender, receiver, lifecycle)) return;
         const auto& from = peer(sender);
         const auto& to = peer(receiver);
+        if ((from.hasSwarm(swarmId) && !from.isActiveInSwarm(swarmId))
+            || (to.hasSwarm(swarmId) && !to.isActiveInSwarm(swarmId)))
+            throw std::invalid_argument("Inactive swarm membership");
         const auto index = linkIndex(sender, receiver);
         if (message.type() == MessageType::Handshake) {
             swarm(swarmId);
@@ -385,7 +396,7 @@ namespace simulator {
             ? std::optional<RequestPayload>(std::get<RequestPayload>(message.payload())) : std::nullopt;
         auto& link = links_[index];
         auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
-        direction.pending.push_back({swarmId, sender, receiver, std::move(message)});
+        direction.pending.push_back({swarmId, sender, receiver, std::move(message), lifecycle});
         if (!direction.active) {
             startTransmission(index, sender);
         }
@@ -400,18 +411,25 @@ namespace simulator {
     {
         auto& link = links_[index];
         auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
-        if (direction.active || direction.pending.empty()) return;
+        if (direction.active) return;
+        while (!direction.pending.empty()) {
+            const auto& queued = direction.pending.front();
+            if (!messageStale(queued.swarmId, queued.sender, queued.receiver, queued.lifecycle)) break;
+            direction.pending.pop_front();
+        }
+        if (direction.pending.empty()) return;
 
         // Only the front message is considered. No timing is assigned while queued.
         auto transmission = std::move(direction.pending.front());
         direction.pending.pop_front();
         TransmissionStartEvent event(simulation_.currentTime(), *this, transmission.swarmId,
-            transmission.sender, transmission.receiver, std::move(transmission.message));
+            transmission.sender, transmission.receiver, std::move(transmission.message), transmission.lifecycle);
         simulation_.executeNow(event);
     }
 
     void Network::beginTransmission(QueuedTransmission transmission)
     {
+        if (messageStale(transmission.swarmId, transmission.sender, transmission.receiver, transmission.lifecycle)) return;
         const auto sender = transmission.sender;
         const auto index = linkIndex(sender, transmission.receiver);
         auto& link = links_[index];
@@ -454,7 +472,7 @@ namespace simulator {
         const auto active = active_transmissions_.emplace(id, ActiveTransmission{
             id, transmission.swarmId, sender, transmission.receiver,
             std::move(transmission.message), index, bits,
-            effectiveBandwidth, simulation_.currentTime(), 0}).first;
+            effectiveBandwidth, simulation_.currentTime(), 0, transmission.lifecycle}).first;
         peer_transport_.at(sender).outgoing.insert(id);
         peer_transport_.at(transmission.receiver).incoming.insert(id);
         recomputeRates(affected);
@@ -554,7 +572,7 @@ namespace simulator {
         auto& link = links_[index];
         simulation_.schedule(std::make_unique<MessageArrivalEvent>(
             simulation_.currentTime() + link.latency(), *this, active.swarmId,
-            sender, active.receiver, std::move(active.message)));
+            sender, active.receiver, std::move(active.message), active.lifecycle));
         auto& direction = sender == link.endpointA() ? link.a_to_b_ : link.b_to_a_;
         direction.active = false;
         startTransmission(index, sender);

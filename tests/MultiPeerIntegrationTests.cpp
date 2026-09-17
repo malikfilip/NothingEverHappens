@@ -4,6 +4,10 @@
 #include <cmath>
 #include <deque>
 #include <iostream>
+#include <functional>
+#include <iomanip>
+#include <set>
+#include <sstream>
 #include <memory>
 #include <limits>
 #include <optional>
@@ -12,6 +16,9 @@
 #include <vector>
 
 #include "simulator/MessageArrivalEvent.hpp"
+#include "simulator/PeerJoinEvent.hpp"
+#include "simulator/PeerLeaveEvent.hpp"
+#include "simulator/TrackerAnnounceEvent.hpp"
 #include "simulator/SendMessageEvent.hpp"
 #include "simulator/Simulation.hpp"
 #include "simulator/TransmissionCompleteEvent.hpp"
@@ -249,15 +256,169 @@ void autonomousFourPeerRing(bool tracing)
         && maxPending[4][1] == 5 && maxPending[4][3] == 5, "Scenario never filled the concurrent pipelines");
     std::cout << "PASS: four-peer autonomous ring, all four pieces complete at t=" << simulation.currentTime() << '\n';
 }
+class ObservationAction final : public Event {
+public:
+    ObservationAction(double time, std::function<void()> action)
+        : Event(time), action_(std::move(action)) {}
+    void execute() override { action_(); }
+private:
+    std::function<void()> action_;
+};
+
+void hundredPeerLateJoin()
+{
+    constexpr PeerId latePeer = 101;
+    constexpr double joinTime = 10.0, deadline = 600.0;
+    constexpr double capacity = 10000000, latency = .01;
+    constexpr std::uint32_t pieceLength = 128 * 1024;
+    const Swarm swarm(1, InfoHash{0x72}, 16 * pieceLength, pieceLength);
+    const std::vector<std::uint8_t> completeBits{0xff, 0xff};
+    std::vector<Peer> peers;
+    std::vector<Link> links;
+    for (PeerId id = 1; id <= latePeer; ++id) {
+        peers.emplace_back(id, capacity, capacity, PeerProtocolId{static_cast<std::uint8_t>(id)});
+        for (PeerId other = 1; other < id; ++other) links.emplace_back(other, id, capacity, latency);
+    }
+    Simulation simulation(false, 7);
+    Network network(simulation, peers, links, {swarm}, 50, 30);
+    auto at = [&](double time, std::function<void()> action) {
+        simulation.schedule(std::make_unique<ObservationAction>(time, std::move(action)));
+    };
+    for (PeerId id = 1; id < latePeer; ++id) {
+        std::vector<std::uint8_t> bits(2, 0);
+        if (id <= 2) bits = completeBits;
+        else for (const unsigned offset : {0u, 3u, 7u, 11u}) {
+            const auto index = (id + offset) % 16;
+            bits[index / 8] |= static_cast<std::uint8_t>(0x80u >> (index % 8));
+        }
+        require(id <= 2 || std::popcount(static_cast<unsigned>(bits[0]))
+            + std::popcount(static_cast<unsigned>(bits[1])) == 4, "Invalid initial partial inventory");
+        simulation.schedule(std::make_unique<PeerJoinEvent>(0, network, 1, id, JoinOptions{8, 8, bits}));
+    }
+    bool joined = false, started = false;
+    std::optional<double> completionTime;
+    std::size_t completionConnections = 0;
+    std::set<PeerId> discoveredRelationships;
+    unsigned requests = 0, pieces = 0;
+    auto outstanding = [](const PeerSwarmState& state) {
+        std::size_t count = 0;
+        for (const auto& [remote, connection] : state.connections)
+            count += connection.scheduledRequests.size() + connection.outgoingRequests.size();
+        return count;
+    };
+    auto checkCoverage = [&] {
+        const auto& state = network.peer(latePeer).swarmState(1);
+        require(state.localBitfield == completeBits && state.receivedBlocks.size() == 16,
+            "Late peer does not own the complete torrent");
+        for (std::uint32_t piece = 0; piece < 16; ++piece)
+            require(state.receivedBlocks.at(piece) == std::vector<BlockRange>{{0, pieceLength}},
+                "Late peer has incomplete piece byte coverage");
+    };
+    simulation.setEventObserver([&](const Event& event) {
+        if (event.time() < joinTime)
+            require(!network.peer(latePeer).isActiveInSwarm(1), "Peer 101 active before t=10");
+        if (const auto* announce = dynamic_cast<const TrackerAnnounceEvent*>(&event);
+            announce && announce->peerId() == latePeer && announce->kind() == AnnounceKind::Started) {
+            require(joined && sameTime(event.time(), joinTime), "Late STARTED did not follow runtime join at t=10");
+            started = true;
+        }
+        if (const auto* send = dynamic_cast<const SendMessageEvent*>(&event);
+            send && send->details().sender == latePeer && send->details().messageType == MessageType::Handshake) {
+            require(started, "Late handshake preceded STARTED discovery");
+            discoveredRelationships.insert(send->details().receiver);
+        }
+        if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event);
+            start && start->details().sender == latePeer && start->details().messageType == MessageType::Request)
+            ++requests;
+        if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event);
+            arrival && arrival->details().receiver == latePeer && arrival->details().messageType == MessageType::Piece) {
+            ++pieces;
+            // The observer precedes delivery. This read-only same-time action sees
+            // the resulting inventory without changing relative protocol-event order.
+            at(event.time(), [&] {
+                const auto& state = network.peer(latePeer).swarmState(1);
+                if (!completionTime && state.localBitfield == completeBits) {
+                    completionTime = simulation.currentTime();
+                    checkCoverage();
+                    require(outstanding(state) == 0, "Late peer completed with pending download requests");
+                    for (const auto& [remote, connection] : state.connections)
+                        if (connection.handshakeComplete()) ++completionConnections;
+                }
+            });
+        }
+    });
+    at(joinTime, [&] {
+        require(!network.peer(latePeer).isActiveInSwarm(1), "Late peer already active at join");
+        for (PeerId id = 1; id < latePeer; ++id)
+            require(network.peer(id).isActiveInSwarm(1), "Initial peer not active before late join");
+        network.joinSwarm(1, latePeer, JoinOptions{8, 8, std::nullopt});
+        joined = true;
+        const auto& state = network.peer(latePeer).swarmState(1);
+        require(state.localBitfield == std::vector<std::uint8_t>{0, 0} && state.receivedBlocks.empty()
+            && state.connections.empty(), "Late runtime join did not start completely empty");
+    });
+    std::size_t finalOutstanding = 0;
+    at(deadline, [&] {
+        const auto& state = network.peer(latePeer).swarmState(1);
+        finalOutstanding = outstanding(state);
+        if (!completionTime) {
+            std::cerr << "[100-peer late join stalled] observed t=" << simulation.currentTime()
+                << " STARTED=" << started << " admitted handshake peers:";
+            for (const auto remote : discoveredRelationships) std::cerr << ' ' << remote;
+            std::cerr << "\ncompleted pieces:";
+            for (unsigned piece = 0; piece < 16; ++piece)
+                if (state.localBitfield[piece / 8] & (0x80u >> (piece % 8))) std::cerr << ' ' << piece;
+            std::cerr << "\nREQUEST starts=" << requests << " PIECE arrivals=" << pieces
+                << " pending download requests=" << finalOutstanding << '\n';
+            std::set<PeerId> remotes;
+            for (const auto& [remote, connection] : state.connections) remotes.insert(remote);
+            for (const auto remote : remotes) {
+                const auto& connection = state.connections.at(remote);
+                std::cerr << "remote=" << remote << " handshake=" << connection.handshakeComplete()
+                    << " chokesUs=" << connection.remoteIsChokingUs
+                    << " interested=" << connection.weAreInterestedInRemote
+                    << " scheduled=" << connection.scheduledRequests.size()
+                    << " outgoing=" << connection.outgoingRequests.size() << " visible pieces:";
+                for (unsigned piece = 0; piece < 16; ++piece)
+                    if (piece / 8 < connection.remoteBitfield.size()
+                        && (connection.remoteBitfield[piece / 8] & (0x80u >> (piece % 8)))) std::cerr << ' ' << piece;
+                std::cerr << '\n';
+            }
+        }
+    });
+    // A fixed observation horizon keeps failed scenarios finite. Cleanup never
+    // assists the download and its timestamp is not used as completion time.
+    for (PeerId id = 1; id <= latePeer; ++id)
+        simulation.schedule(std::make_unique<PeerLeaveEvent>(deadline + 1, network, 1, id));
+    simulation.run();
+    require(joined && started && !discoveredRelationships.empty() && completionConnections > 0,
+        "Late peer never established a tracker-discovered relationship");
+    require(completionTime.has_value(), "Peer 101 did not complete by the observation deadline; see diagnostics");
+    const double duration = *completionTime - joinTime;
+    require(std::isfinite(*completionTime) && *completionTime > joinTime
+        && std::isfinite(duration) && duration > 0, "Invalid late-peer completion timing");
+    require(requests > 0 && pieces > 0 && finalOutstanding == 0, "Late download protocol or request cleanup incomplete");
+    checkCoverage();
+    require(network.activeTransmissions().empty(), "Controlled leaves did not drain transmissions");
+    std::ostringstream diagnostic;
+    diagnostic << std::setprecision(std::numeric_limits<double>::max_digits10)
+        << "[100-peer late join]\njoined:      t=" << joinTime
+        << "\ncompleted:   t=" << *completionTime << "\nduration:    " << duration
+        << " s\npieces:      16/16\nconnections: " << completionConnections
+        << " (at completion)\nrequests remaining: " << finalOutstanding << '\n';
+    std::cout << diagnostic.str();
+}
 } // namespace
 
 int main(int argc, char* argv[])
 {
     try {
-        autonomousFourPeerRing(argc > 1 && std::string_view(argv[1]) == "--trace");
+        if (!(argc > 1 && std::string_view(argv[1]) == "--late-join-only"))
+            autonomousFourPeerRing(argc > 1 && std::string_view(argv[1]) == "--trace");
+        hundredPeerLateJoin();
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "FAIL: four-peer autonomous ring: " << error.what() << '\n';
+        std::cerr << "FAIL: multi-peer integration: " << error.what() << '\n';
         return 1;
     }
 }

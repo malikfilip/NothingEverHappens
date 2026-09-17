@@ -30,22 +30,38 @@ namespace simulator {
         double currentRate; // Bits per simulation second.
         double lastRateUpdateTime;
         std::uint64_t generation;
+        LifecycleContext lifecycle;
+    };
+
+    struct JoinOptions {
+        std::size_t numwant = 50;
+        std::size_t targetOutgoingConnections = 8;
+        std::optional<std::vector<std::uint8_t>> initialBitfield;
     };
 
     class Network {
     public:
         // Simulation must outlive this network, which owns its peers, links, and swarms.
-        Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms = {}, std::size_t trackerMaximum = 50);
+        Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms = {}, std::size_t trackerMaximum = 50, double trackerInterval = 1800);
 
-        // Configure before discovery. Default cap is 8 per peer/swarm; zero disables admission.
-        // Rejects a cap below existing plus reserved neighbors.
-        void setMaxNeighbors(SwarmId swarmId, PeerId peer, std::size_t maximum);
+        // Runtime APIs execute atomically at current simulation time.
+        void joinSwarm(SwarmId swarmId, PeerId peer, JoinOptions options = {});
+        void leaveSwarm(SwarmId swarmId, PeerId peer);
+        // Read-only lifecycle snapshots used by events. Missing membership has generation zero.
+        std::uint64_t lifecycleGeneration(SwarmId swarmId, PeerId peer) const;
+        LifecycleContext lifecycleContext(SwarmId swarmId, PeerId sender, PeerId receiver) const;
+        bool lifecycleCurrent(SwarmId swarmId, PeerId peer, std::uint64_t generation) const;
+        bool messageStale(SwarmId swarmId, PeerId sender, PeerId receiver, LifecycleContext context) const;
+
+        // Tracker-initiated target per peer/swarm (default 8); zero still allows incoming relationships.
+        // Rejects a target below live plus pending self-initiated relationships.
+        void setTargetOutgoingConnections(SwarmId swarmId, PeerId peer, std::size_t target);
         // One-shot registration/discovery; validates membership and unique swarm info hashes.
         void announceToTracker(SwarmId swarmId, PeerId peer, std::size_t numwant);
 
         // Enqueues transmission, starting immediately if idle; throws std::invalid_argument for missing endpoints,
         // a missing link, or invalid transfer bandwidth/latency.
-        void send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message);
+        void send(SwarmId swarmId, PeerId sender, PeerId receiver, Message message, std::optional<LifecycleContext> context = std::nullopt);
 
         // Throws std::invalid_argument for an unknown receiver/swarm or rejected message.
         void deliver(SwarmId swarmId, PeerId sender, PeerId receiver, const Message& message);
@@ -77,6 +93,10 @@ namespace simulator {
         friend class TransmissionCompleteEvent;
         friend class TransmissionStartEvent;
         friend class RechokeEvent;
+        friend class TrackerAnnounceEvent;
+        void processTrackerAnnounce(SwarmId swarmId, PeerId peer, std::size_t numwant, AnnounceKind kind,
+            std::uint64_t generation, bool periodic, double eventTime);
+        void scheduleTrackerAnnounce(SwarmId swarmId, PeerId peer, AnnounceKind kind, double time);
         void scheduleRechoke(PeerId local, SwarmId swarmId);
         void rechoke(PeerId local, SwarmId swarmId);
         bool hasUsefulExchange(PeerId local, SwarmId swarmId) const;
@@ -88,8 +108,8 @@ namespace simulator {
         void enforceInterestedLimit(PeerId local, SwarmId swarmId);
         // Network owns multiple peers, so the local requester is explicit.
         void tryScheduleRequests(Peer& requester, SwarmId swarmId, PeerId remotePeerId);
-        void sendScheduledPiece(SwarmId swarmId, PeerId sender, PeerId receiver, Message message);
-        void sendScheduledRequest(SwarmId swarmId, PeerId sender, PeerId receiver, Message message);
+        void sendScheduledPiece(SwarmId swarmId, PeerId sender, PeerId receiver, Message message, LifecycleContext context);
+        void sendScheduledRequest(SwarmId swarmId, PeerId sender, PeerId receiver, Message message, LifecycleContext context);
         static std::optional<RequestPayload> nextRequestBlock(const Swarm& swarm,
             const PeerSwarmState& state, std::uint32_t piece, std::uint32_t begin = 0);
         static std::optional<std::uint32_t> selectPiece(const Swarm& swarm,
@@ -115,8 +135,12 @@ namespace simulator {
         std::map<TransmissionId, ActiveTransmission> active_transmissions_;
         TransmissionId next_transmission_id_ = 1;
         struct DiscoveryState {
-            std::size_t maxNeighbors = 8;
-            std::set<PeerId> pending;
+            std::size_t targetOutgoingConnections = 8;
+            std::set<PeerId> pending; // Both endpoints reserve duplicate suppression until handshake completion.
+            std::set<PeerId> initiatedNeighbors; // Owned tracker attempts, pending or established; excludes incoming.
+            std::size_t numwant = 50;
+            bool periodic = false;
+            std::optional<double> nextAnnounce;
         };
         void validateTrackerSetup() const;
         std::set<PeerId> neighbors(SwarmId swarmId, PeerId peer) const;

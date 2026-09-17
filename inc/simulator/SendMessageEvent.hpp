@@ -17,7 +17,7 @@ namespace simulator {
         SendMessageEvent(double time, Network& network, SwarmId swarmId, PeerId sender, PeerId receiver, Message message,
                          bool automaticRequest = false, bool automaticPiece = false)
             : Event(time), network_(network), swarmId_(swarmId), sender_(sender), receiver_(receiver),
-              message_(std::move(message)), automaticRequest_(automaticRequest), automaticPiece_(automaticPiece)
+              message_(std::move(message)), automaticRequest_(automaticRequest), automaticPiece_(automaticPiece), lifecycle_(network.lifecycleContext(swarmId, sender, receiver))
         {
         }
 
@@ -28,9 +28,10 @@ namespace simulator {
         }
         void execute() override
         {
-            if (automaticRequest_) network_.sendScheduledRequest(swarmId_, sender_, receiver_, std::move(message_));
-            else if (automaticPiece_) network_.sendScheduledPiece(swarmId_, sender_, receiver_, std::move(message_));
-            else network_.send(swarmId_, sender_, receiver_, std::move(message_));
+            if (network_.messageStale(swarmId_, sender_, receiver_, lifecycle_)) return;
+            if (automaticRequest_) network_.sendScheduledRequest(swarmId_, sender_, receiver_, std::move(message_), lifecycle_);
+            else if (automaticPiece_) network_.sendScheduledPiece(swarmId_, sender_, receiver_, std::move(message_), lifecycle_);
+            else network_.send(swarmId_, sender_, receiver_, std::move(message_), lifecycle_);
         }
 
     private:
@@ -41,6 +42,7 @@ namespace simulator {
         Message message_;
         bool automaticRequest_;
         bool automaticPiece_;
+        LifecycleContext lifecycle_;
     };
 
 } // namespace simulator

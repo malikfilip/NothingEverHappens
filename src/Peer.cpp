@@ -79,7 +79,7 @@ namespace simulator {
     {
         const RequestPayload block{piece.index, piece.begin, piece.length};
         validateBlock(swarm, block);
-        if (!hasSwarm(swarm.id()) || !remote.hasSwarm(swarm.id())) {
+        if (!isActiveInSwarm(swarm.id()) || !remote.isActiveInSwarm(swarm.id())) {
             throw std::invalid_argument("PIECE peers must share the swarm");
         }
         const auto& state = swarmState(swarm.id());
@@ -102,7 +102,7 @@ namespace simulator {
 
     void Peer::validateRequestTo(const Swarm& swarm, const Peer& remote, const RequestPayload& request) const
     {
-        if (!hasSwarm(swarm.id()) || !remote.hasSwarm(swarm.id())) {
+        if (!isActiveInSwarm(swarm.id()) || !remote.isActiveInSwarm(swarm.id())) {
             throw std::invalid_argument("REQUEST peers must share the swarm");
         }
         const auto& state = swarmState(swarm.id());
@@ -122,7 +122,7 @@ namespace simulator {
     void Peer::receiveMessage(const Swarm& swarm, PeerId sender, const Message& message, const PeerProtocolId* senderProtocolId, const Peer* senderPeer)
     {
         const auto state = swarm_states_.find(swarm.id());
-        if (state == swarm_states_.end()) {
+        if (state == swarm_states_.end() || !state->second.active) {
             throw std::invalid_argument("Receiving peer has not joined this swarm");
         }
         const auto byteCount = swarm.pieceCount() / 8 + (swarm.pieceCount() % 8 != 0);
@@ -187,7 +187,7 @@ namespace simulator {
             const RequestPayload block{piece.index, piece.begin, piece.length};
             validateBlock(swarm, block);
             const auto connection = state->second.connections.find(sender);
-            if (!senderPeer || senderPeer->id() != sender || !senderPeer->hasSwarm(swarm.id())
+            if (!senderPeer || senderPeer->id() != sender || !senderPeer->isActiveInSwarm(swarm.id())
                 || connection == state->second.connections.end() || !connection->second.handshakeComplete()) {
                 throw std::invalid_argument("PIECE requires an established sender in this swarm");
             }
@@ -275,7 +275,7 @@ namespace simulator {
     void Peer::markHandshakeSent(const Swarm& swarm, PeerId receiver)
     {
         const auto state = swarm_states_.find(swarm.id());
-        if (state == swarm_states_.end()) {
+        if (state == swarm_states_.end() || !state->second.active) {
             throw std::invalid_argument("Sending peer has not joined this swarm");
         }
         const auto byteCount = swarm.pieceCount() / 8 + (swarm.pieceCount() % 8 != 0);
@@ -287,6 +287,12 @@ namespace simulator {
     bool Peer::hasSwarm(SwarmId swarmId) const
     {
         return swarm_states_.contains(swarmId);
+    }
+
+    bool Peer::isActiveInSwarm(SwarmId swarmId) const
+    {
+        const auto state = swarm_states_.find(swarmId);
+        return state != swarm_states_.end() && state->second.active;
     }
 
     const PeerSwarmState& Peer::swarmState(SwarmId swarmId) const

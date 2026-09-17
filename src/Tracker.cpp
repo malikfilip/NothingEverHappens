@@ -2,7 +2,15 @@
 #include <algorithm>
 
 namespace simulator {
-    std::vector<PeerId> Tracker::announce(const InfoHash& hash, PeerId peer, std::size_t numwant) {
+    std::vector<PeerId> Tracker::announce(const InfoHash& hash, PeerId peer, std::size_t numwant, AnnounceKind kind) {
+        if (kind == AnnounceKind::Stopped) {
+            const auto found = registrations_.find(hash);
+            if (found != registrations_.end()) {
+                found->second.erase(peer);
+                if (found->second.empty()) registrations_.erase(found);
+            }
+            return {};
+        }
         auto& peers = registrations_[hash];
         peers.insert(peer);
         const auto limit = std::min(numwant, maximum_);

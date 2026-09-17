@@ -65,6 +65,8 @@ namespace simulator {
         std::unordered_map<PeerId, PeerConnectionState> connections;
         std::unordered_map<std::uint32_t, std::vector<BlockRange>> receivedBlocks;
         ChokingState choking;
+        bool active = true; // Legacy setup-time join is active.
+        std::uint64_t lifecycleGeneration = 1;
     };
 
     class Peer {
@@ -90,6 +92,7 @@ namespace simulator {
         // Called by Network when a validated transfer begins.
         void markHandshakeSent(const Swarm& swarm, PeerId receiver);
         bool hasSwarm(SwarmId swarmId) const;
+        bool isActiveInSwarm(SwarmId swarmId) const;
         // Throws std::out_of_range if this SwarmId has not been joined.
         const PeerSwarmState& swarmState(SwarmId swarmId) const;
 
