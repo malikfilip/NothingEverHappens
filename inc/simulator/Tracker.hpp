@@ -20,6 +20,10 @@ namespace simulator {
                 throw std::invalid_argument("Tracker interval must be positive and finite");
         }
         double interval() const { return interval_; }
+        // Read-only registration set, or an empty set for an unknown/unregistered hash.
+        // Does not register peers or consume RNG. Requery after tracker mutations:
+        // removal of the last registration for a hash invalidates its set reference.
+        const std::set<PeerId>& registeredPeers(const InfoHash& hash) const;
         std::vector<PeerId> announce(const InfoHash& hash, PeerId peer, std::size_t numwant, AnnounceKind kind = AnnounceKind::Regular);
     private:
         std::size_t maximum_;

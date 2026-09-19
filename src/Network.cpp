@@ -446,17 +446,23 @@ namespace simulator {
         connection.bitfieldSent = true;
     }
 
+    const Link* Network::link(PeerId endpointA, PeerId endpointB) const
+    {
+        const auto found = std::find_if(links_.begin(), links_.end(),
+            [endpointA, endpointB](const Link& candidate) {
+                return (candidate.endpointA() == endpointA && candidate.endpointB() == endpointB)
+                    || (candidate.endpointA() == endpointB && candidate.endpointB() == endpointA);
+            });
+        return found == links_.end() ? nullptr : &*found;
+    }
+
     std::size_t Network::linkIndex(PeerId sender, PeerId receiver) const
     {
-        const auto link = std::find_if(links_.begin(), links_.end(),
-            [sender, receiver](const Link& candidate) {
-                return (candidate.endpointA() == sender && candidate.endpointB() == receiver)
-                    || (candidate.endpointA() == receiver && candidate.endpointB() == sender);
-            });
-        if (link == links_.end()) {
+        const auto* found = link(sender, receiver);
+        if (!found) {
             throw std::invalid_argument("No link connects sender and receiver");
         }
-        return static_cast<std::size_t>(link - links_.begin());
+        return static_cast<std::size_t>(found - links_.data());
     }
 
     Network::TransmissionState Network::transmissionState(PeerId sender, PeerId receiver) const

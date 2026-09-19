@@ -2,6 +2,9 @@
 #include <cmath>
 #include <limits>
 #include <source_location>
+#include <type_traits>
+#include <utility>
+#include <tuple>
 #include "simulator/MessageArrivalEvent.hpp"
 #include <algorithm>
 #include <set>
@@ -424,9 +427,126 @@ void lazyRejectsUnusablePeers() {
         rejects([&] { network.transmissionState(1, 2); });
     }
 }
+template<class N>
+constexpr bool constInspectionApi =
+    std::is_same_v<decltype(std::declval<N&>().peers()), const std::vector<Peer>&>
+    && std::is_same_v<decltype(std::declval<N&>().swarms()), const std::vector<Swarm>&>
+    && std::is_same_v<decltype(std::declval<N&>().links()), const std::vector<Link>&>
+    && std::is_same_v<decltype(std::declval<N&>().link(1, 2)), const Link*>
+    && std::is_same_v<decltype(std::declval<N&>().tracker()), const Tracker&>;
+static_assert(constInspectionApi<Network> && constInspectionApi<const Network>);
+static_assert(std::is_same_v<decltype(std::declval<Tracker&>().registeredPeers(InfoHash{})), const std::set<PeerId>&>);
+static_assert(std::is_same_v<decltype(std::declval<const Tracker&>().registeredPeers(InfoHash{})), const std::set<PeerId>&>);
+
+void networkInspection() {
+    auto scenario = [](bool inspect) {
+        const Swarm a(1, InfoHash{1}, 1), b(2, InfoHash{2}, 1);
+        Simulation simulation(false, 12345);
+        Network network(simulation, peers({a, b}, 3), {Link(2, 1, 1000000, .01)}, {a, b}, 50, 7);
+        const Network& view = network;
+        unsigned providerCalls = 0;
+        network.setLinkConfigProvider([&](PeerId from, PeerId to) {
+            check(from == 1 && to == 3);
+            ++providerCalls;
+            return LinkConfig{500000, .02};
+        });
+        std::vector<std::tuple<double, std::uint64_t, std::string>> events;
+        simulation.setEventObserver([&](const Event& event) {
+            events.emplace_back(event.time(), event.sequence(), event.traceDescription());
+        });
+        auto inspectNetwork = [&] {
+            const double time = simulation.currentTime();
+            const auto calls = providerCalls;
+            std::vector<PeerId> ids;
+            for (const auto& peer : view.peers()) {
+                ids.push_back(peer.id());
+                check(&peer == &view.peer(peer.id())); // Enumeration returns owned objects.
+            }
+            check(ids == std::vector<PeerId>({1, 2, 3}));
+            std::vector<SwarmId> swarmIds;
+            for (const auto& swarm : view.swarms()) {
+                swarmIds.push_back(swarm.id());
+                check(&swarm == &view.swarm(swarm.id()));
+                (void)view.tracker().registeredPeers(swarm.infoHash());
+            }
+            check(swarmIds == std::vector<SwarmId>({1, 2}));
+            check(view.tracker().interval() == 7);
+            for (const auto& link : view.links()) {
+                check(view.link(link.endpointA(), link.endpointB()) == &link);
+                check(view.link(link.endpointB(), link.endpointA()) == &link);
+            }
+            check(view.link(2, 3) == nullptr && view.link(99, 1) == nullptr);
+            check(view.tracker().registeredPeers(InfoHash{99}).empty());
+            for (const auto& [id, active] : view.activeTransmissions()) {
+                check(view.link(active.sender, active.receiver) == &view.links().at(active.linkIndex));
+            }
+            check(providerCalls == calls && simulation.currentTime() == time);
+        };
+        if (inspect) {
+            inspectNetwork();
+            check(view.links().size() == 1 && view.link(1, 3) == nullptr);
+            check(view.tracker().registeredPeers(a.infoHash()).empty());
+            check(providerCalls == 0 && events.empty() && !simulation.step());
+        }
+        network.announceToTracker(1, 2, 0);
+        network.announceToTracker(1, 3, 0);
+        network.announceToTracker(2, 2, 0);
+        if (inspect) {
+            inspectNetwork();
+            check(view.tracker().registeredPeers(a.infoHash()) == std::set<PeerId>({2, 3}));
+            check(view.tracker().registeredPeers(b.infoHash()) == std::set<PeerId>({2}));
+        }
+        network.announceToTracker(1, 1, 3);
+        check(providerCalls == 1);
+        if (inspect) {
+            inspectNetwork();
+            check(view.links().size() == 2);
+            const auto* lazy = view.link(3, 1);
+            check(lazy && lazy->bandwidth() == 500000 && lazy->latency() == .02);
+            check(view.link(1, 2)->bandwidth() == 1000000 && view.link(1, 2)->latency() == .01);
+        }
+        while (simulation.step()) {
+            if (inspect) inspectNetwork();
+        }
+        check(network.peer(1).swarmState(1).connections.size() == 2);
+        check(network.peer(1).swarmState(1).connections.at(2).handshakeComplete());
+        check(network.peer(1).swarmState(1).connections.at(3).handshakeComplete());
+        check(network.peer(1).swarmState(2).connections.empty());
+        check(network.activeTransmissions().empty());
+        check(network.tracker().registeredPeers(a.infoHash()) == std::set<PeerId>({1, 2, 3}));
+        return events;
+    };
+    // Inspection before discovery and between every event preserves RNG, scheduling
+    // and the complete protocol event trace.
+    check(scenario(true) == scenario(false));
+    Simulation simulation;
+    Network empty(simulation, {}, {});
+    check(empty.peers().empty() && empty.swarms().empty() && empty.links().empty());
+    check(empty.link(1, 2) == nullptr && !simulation.step());
+}
+
+void trackerInspection() {
+    Tracker inspected(3, 12345), baseline(3, 12345);
+    const InfoHash a{1}, b{2}, absent{99};
+    for (PeerId id = 1; id <= 8; ++id) {
+        for (auto* tracker : {&inspected, &baseline}) {
+            tracker->announce(a, id, 0);
+            tracker->announce(b, id + 10, 0);
+        }
+    }
+    for (unsigned round = 0; round < 4; ++round) {
+        check(inspected.registeredPeers(a) == std::set<PeerId>({1, 2, 3, 4, 5, 6, 7, 8}));
+        check(inspected.registeredPeers(b) == std::set<PeerId>({11, 12, 13, 14, 15, 16, 17, 18}));
+        check(inspected.registeredPeers(absent).empty());
+        check(inspected.announce(a, 1, 3) == baseline.announce(a, 1, 3));
+        check(inspected.announce(b, 11, 3) == baseline.announce(b, 11, 3));
+    }
+}
 }
 int main() {
     const std::pair<const char*, void(*)()> tests[] = {
+        {"Const enumeration and physical lookup preserve complete event execution", networkInspection},
+        {"Tracker inspection is hash-isolated and consumes no sampling randomness", trackerInspection},
         {"Lazy and preconfigured paths reuse physical indices across orientations and swarms", lazyCreationAndReuse},
         {"No provider and invalid configuration leave no path or reservation", noProviderAndInvalidConfiguration},
         {"Outgoing targets prevent unnecessary lazy paths, pending and established", lazyOutgoingLimit},

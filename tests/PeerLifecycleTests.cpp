@@ -129,6 +129,41 @@ void independentPeriodicNumwant() {
     sim.run();
     check(net.activeTransmissions().empty(), "Lazy periodic transmissions leaked");
 }
+void trackerMembershipInspection() {
+    const Swarm a(1, InfoHash{1}, 1), b(2, InfoHash{2}, 1);
+    Simulation sim;
+    Network net(sim, makePeers(2), {}, {a, b}, 50, 7);
+    const auto& tracker = net.tracker();
+    check(tracker.interval() == 7, "Network tracker interval inaccessible");
+    check(tracker.registeredPeers(a.infoHash()).empty(), "Unexpected initial registrations");
+    net.joinSwarm(1, 1, JoinOptions{0, 0, std::nullopt});
+    net.joinSwarm(2, 1, JoinOptions{0, 0, std::nullopt});
+    net.joinSwarm(1, 2, JoinOptions{0, 0, std::nullopt});
+    check(tracker.registeredPeers(a.infoHash()).empty()
+        && tracker.registeredPeers(b.infoHash()).empty(), "Inspection registered before STARTED");
+    check(sim.currentTime() == 0 && net.links().empty(), "Inspection advanced time or created Links");
+    check(sim.step(), "Missing first STARTED");
+    check(tracker.registeredPeers(a.infoHash()) == std::set<PeerId>{1}
+        && tracker.registeredPeers(b.infoHash()).empty(), "First STARTED registration/isolation incorrect");
+    check(sim.step() && sim.step(), "Missing other STARTED events");
+    check(tracker.registeredPeers(a.infoHash()) == std::set<PeerId>({1, 2})
+        && tracker.registeredPeers(b.infoHash()) == std::set<PeerId>{1}, "Multi-swarm registrations missing");
+    net.leaveSwarm(1, 1);
+    check(tracker.registeredPeers(a.infoHash()) == std::set<PeerId>{2}
+        && tracker.registeredPeers(b.infoHash()) == std::set<PeerId>{1}, "Leave leaked across swarms");
+    net.leaveSwarm(1, 2);
+    check(tracker.registeredPeers(a.infoHash()).empty(), "Last leave retained registration");
+    net.joinSwarm(1, 1, JoinOptions{0, 0, std::nullopt});
+    check(tracker.registeredPeers(a.infoHash()).empty(), "Rejoin registered before STARTED");
+    check(sim.step(), "Missing rejoin STARTED");
+    check(tracker.registeredPeers(a.infoHash()) == std::set<PeerId>{1}, "Rejoin not reflected");
+    net.leaveSwarm(1, 1);
+    net.leaveSwarm(2, 1);
+    check(tracker.registeredPeers(a.infoHash()).empty()
+        && tracker.registeredPeers(b.infoHash()).empty(), "Final registrations not removed");
+    check(sim.currentTime() == 0 && net.links().empty(), "Queries changed time/topology");
+    sim.run(); // Drain stale timers after all runtime memberships leave.
+}
 void runtimeJoin() {
     Swarm swarm(1, InfoHash{1}, 1);
     Simulation sim(false, 7);
@@ -739,6 +774,7 @@ void partialDataRejoin() {
 }
 int main() {
     const std::pair<const char*, void(*)()> tests[] = {
+        {"Read-only tracker registration inspection follows multi-swarm join/leave/rejoin", trackerMembershipInspection},
         {"Periodic numwant is independent of outgoing slots, including full-target sampling", independentPeriodicNumwant},
         {"Runtime join, observability, periodic discovery and exact single-chain timing", runtimeJoin},
         {"Runtime join through STARTED discovery completes automatic download and drains", runtimeDownload},

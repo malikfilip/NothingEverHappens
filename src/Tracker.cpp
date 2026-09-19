@@ -2,6 +2,12 @@
 #include <algorithm>
 
 namespace simulator {
+    const std::set<PeerId>& Tracker::registeredPeers(const InfoHash& hash) const {
+        static const std::set<PeerId> empty;
+        const auto found = registrations_.find(hash);
+        return found == registrations_.end() ? empty : found->second;
+    }
+
     std::vector<PeerId> Tracker::announce(const InfoHash& hash, PeerId peer, std::size_t numwant, AnnounceKind kind) {
         if (kind == AnnounceKind::Stopped) {
             const auto found = registrations_.find(hash);

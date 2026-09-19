@@ -80,6 +80,18 @@ namespace simulator {
         // Throws std::invalid_argument for an unknown receiver/swarm or rejected message.
         void deliver(SwarmId swarmId, PeerId sender, PeerId receiver, const Message& message);
 
+        // Read-only live views owned by this Network; inspect between engine mutations.
+        // Container references remain valid for the Network lifetime. Lazy Link append
+        // may invalidate Link element references, pointers and iterators; reacquire them.
+        const std::vector<Peer>& peers() const { return peers_; }
+        const std::vector<Swarm>& swarms() const { return swarms_; }
+        const std::vector<Link>& links() const { return links_; }
+        const Tracker& tracker() const { return tracker_; }
+
+        // Physical unordered endpoint pair; nullptr if absent. Never creates a Link.
+        // The pointer may be invalidated by lazy Link creation.
+        const Link* link(PeerId endpointA, PeerId endpointB) const;
+
         // Read-only lookup; throws std::invalid_argument for an unknown ID.
         const Peer& peer(PeerId id) const;
         const Swarm& swarm(SwarmId id) const;
