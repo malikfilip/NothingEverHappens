@@ -1,5 +1,15 @@
 <RCC>
     <qresource prefix="/">
         <file>resources/nodes/tracker.png</file>
+        <file>resources/messages/handshake.png</file>
+        <file>resources/messages/bitfield.png</file>
+        <file>resources/messages/have.png</file>
+        <file>resources/messages/interested.png</file>
+        <file>resources/messages/not_interested.png</file>
+        <file>resources/messages/choke.png</file>
+        <file>resources/messages/unchoke.png</file>
+        <file>resources/messages/request.png</file>
+        <file>resources/messages/piece.png</file>
+        <file>resources/messages/cancel.png</file>
     </qresource>
 </RCC>

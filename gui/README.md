@@ -2,7 +2,12 @@
 
 The GUI is independent of the simulator engine. Add Swarm creates GUI-only
 file or virtual swarm metadata. The swarm selector, Swarm Info, and message-filter
-checkboxes are interactive; peer and simulation controls remain disabled.
+checkboxes are interactive. Add Peer configures a peer in the active swarm, then
+starts canvas placement. Left-click places it; Escape or right-click cancels.
+Drag a placed red node or its label to move it; right-click offers Remove Peer.
+Each swarm retains its own peers and positions in a bounded, scrollable scene.
+Bandwidth inputs use whole KiB/s, MiB/s, or GiB/s with exact byte/s storage.
+Simulation controls remain disabled.
 
 Configure with a Qt 6 Widgets kit matching your compiler:
 

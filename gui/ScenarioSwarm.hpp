@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ScenarioPeer.hpp"
+#include <vector>
 #include <QString>
 #include <QtGlobal>
 
@@ -14,6 +16,7 @@ struct ScenarioSwarm {
     quint64 totalSizeBytes = 0;
     quint64 pieceSizeBytes = 0;
     quint64 pieceCount = 0;
+    std::vector<ScenarioPeer> peers;
 
     // Presentation metadata; byte fields above remain authoritative for calculations.
     QString virtualSizeDisplayValue;

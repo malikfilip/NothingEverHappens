@@ -2,6 +2,11 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
 qt_add_executable(picoTorrent_gui
     main.cpp
+    ScenarioPeer.hpp
+    AddPeerDialog.hpp
+    AddPeerDialog.cpp
+    MessageInfoDialog.hpp
+    MessageInfoDialog.cpp
     AddSwarmDialog.hpp
     AddSwarmDialog.cpp
     ScenarioSwarm.hpp

@@ -1,13 +1,18 @@
 #include "MainWindow.hpp"
+#include "MessageInfoDialog.hpp"
 #include "AddSwarmDialog.hpp"
+#include "AddPeerDialog.hpp"
 #include "SimulationView.hpp"
 
 #include <array>
+#include <algorithm>
 
 #include <QAction>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QGroupBox>
+#include <QGridLayout>
+#include <QPixmap>
 #include <QDialogButtonBox>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -22,6 +27,7 @@
 #include <QStyle>
 #include <QTableView>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 MainWindow::MainWindow(QWidget* parent)
@@ -36,6 +42,27 @@ MainWindow::MainWindow(QWidget* parent)
     auto* canvasLayout = new QVBoxLayout(canvasPanel);
     canvas_ = new SimulationView(canvasPanel);
     canvasLayout->addWidget(canvas_);
+    canvas_->peerPlaced = [this](quint64 swarmId, const ScenarioPeer& peer) {
+        if (auto* swarm = findSwarm(swarmId)) {
+            swarm->peers.push_back(peer);
+            ++nextPeerId_;
+        }
+    };
+    canvas_->peerMoved = [this](quint64 swarmId, quint64 peerId, QPointF position) {
+        if (auto* swarm = findSwarm(swarmId)) {
+            for (auto& peer : swarm->peers)
+                if (peer.id == peerId) { peer.position = position; break; }
+        }
+    };
+    canvas_->peerRemoved = [this](quint64 swarmId, quint64 peerId) {
+        if (auto* swarm = findSwarm(swarmId))
+            std::erase_if(swarm->peers, [peerId](const ScenarioPeer& peer) { return peer.id == peerId; });
+    };
+    canvas_->placementChanged = [this] {
+        addPeerAction_->setEnabled(swarmSelector_->currentIndex() >= 0 && !canvas_->isPlacingPeer());
+        canvas_->setToolTip(canvas_->isPlacingPeer()
+            ? tr("Click to place the peer. Escape or right-click cancels placement.") : QString{});
+    };
 
     auto* left = new QSplitter(Qt::Vertical);
     left->setObjectName("canvasLogSplitter");
@@ -83,7 +110,9 @@ void MainWindow::createToolbar()
         action->setToolTip(tr("Not connected yet."));
     };
     connect(toolbar->addAction(tr("+ Swarm")), &QAction::triggered, this, &MainWindow::addSwarm);
-    disable(toolbar->addAction(tr("Add Peer")));
+    addPeerAction_ = toolbar->addAction(tr("+ Peer"));
+    addPeerAction_->setEnabled(false);
+    connect(addPeerAction_, &QAction::triggered, this, &MainWindow::addPeer);
     toolbar->addSeparator();
     disable(toolbar->addAction(style()->standardIcon(QStyle::SP_MediaStop), tr("Stop")));
     disable(toolbar->addAction(style()->standardIcon(QStyle::SP_MediaPlay), tr("Play")));
@@ -113,6 +142,7 @@ void MainWindow::createToolbar()
     connect(swarmSelector_, &QComboBox::currentIndexChanged, this, [this](int index) {
         const bool active = index >= 0 && static_cast<std::size_t>(index) < swarms_.size();
         swarmInfo_->setEnabled(active);
+        addPeerAction_->setEnabled(active);
         if (canvas_) canvas_->showSwarm(active ? &swarms_[index] : nullptr);
     });
 }
@@ -180,19 +210,37 @@ QWidget* MainWindow::createMessageFilter()
     scroll->setWidgetResizable(true);
     scroll->setFrameShape(QFrame::NoFrame);
     auto* contents = new QWidget(scroll);
-    auto* checksLayout = new QVBoxLayout(contents);
+    auto* checksLayout = new QGridLayout(contents);
     checksLayout->setContentsMargins(0, 0, 0, 0);
-    const std::array<const char*, 10> names{
-        "HANDSHAKE", "BITFIELD", "HAVE", "INTERESTED", "NOT_INTERESTED",
-        "CHOKE", "UNCHOKE", "REQUEST", "PIECE", "CANCEL"
+    using MessageType = MessageInfoDialog::Type;
+    const std::array<MessageType, 10> types{
+        MessageType::Handshake, MessageType::Bitfield, MessageType::Have,
+        MessageType::Interested, MessageType::NotInterested, MessageType::Choke,
+        MessageType::Unchoke, MessageType::Request, MessageType::Piece, MessageType::Cancel
     };
     std::array<QCheckBox*, 10> checks{};
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        checks[i] = new QCheckBox(QString::fromLatin1(names[i]), contents);
+    for (std::size_t i = 0; i < types.size(); ++i) {
+        checks[i] = new QCheckBox(MessageInfoDialog::messageName(types[i]), contents);
         checks[i]->setChecked(true);
-        checksLayout->addWidget(checks[i]);
+        const int row = static_cast<int>(i);
+        checksLayout->addWidget(checks[i], row, 0);
+        const auto type = types[i];
+        auto* icon = new QToolButton(contents);
+        icon->setAutoRaise(true);
+        icon->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        icon->setIcon(QIcon(QPixmap(MessageInfoDialog::iconPath(type)).scaled(24, 24,
+            Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+        icon->setIconSize(QSize(24, 24));
+        icon->setToolTip(tr("About %1").arg(MessageInfoDialog::messageName(type)));
+        icon->setAccessibleName(icon->toolTip());
+        connect(icon, &QToolButton::clicked, this, [this, type] {
+            MessageInfoDialog dialog(type, this);
+            dialog.exec();
+        });
+        checksLayout->addWidget(icon, row, 1);
     }
-    checksLayout->addStretch();
+    checksLayout->setColumnStretch(2, 1);
+    checksLayout->setRowStretch(static_cast<int>(types.size()), 1);
     scroll->setWidget(contents);
     layout->addWidget(scroll);
 
@@ -252,4 +300,22 @@ void MainWindow::showSwarmInfo()
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     layout->addWidget(buttons);
     dialog.exec();
+}
+
+ScenarioSwarm* MainWindow::findSwarm(quint64 id)
+{
+    const auto it = std::find_if(swarms_.begin(), swarms_.end(),
+        [id](const ScenarioSwarm& swarm) { return swarm.id == id; });
+    return it == swarms_.end() ? nullptr : &*it;
+}
+
+void MainWindow::addPeer()
+{
+    const int index = swarmSelector_->currentIndex();
+    if (index < 0 || static_cast<std::size_t>(index) >= swarms_.size() || canvas_->isPlacingPeer()) return;
+    AddPeerDialog dialog(tr("Peer %1").arg(nextPeerId_), swarms_[index].pieceCount, this);
+    if (dialog.exec() != QDialog::Accepted) return;
+    auto peer = dialog.peer();
+    peer.id = nextPeerId_;
+    canvas_->beginPeerPlacement(peer);
 }
