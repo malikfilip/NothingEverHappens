@@ -94,3 +94,8 @@ if(BUILD_TESTING)
     target_include_directories(endgame_tests PRIVATE inc)
     add_test(NAME endgame COMMAND endgame_tests)
 endif()
+
+option(PICOTORRENT_BUILD_GUI "Build the Qt 6 Widgets GUI" OFF)
+if(PICOTORRENT_BUILD_GUI)
+    add_subdirectory(gui)
+endif()
