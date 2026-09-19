@@ -22,6 +22,10 @@ namespace simulator {
 
         void schedule(std::unique_ptr<Event> event);
 
+        // Executes one queued event, including any synchronous executeNow() calls.
+        // Returns false without changing time when empty; execution exceptions propagate.
+        bool step();
+
         void run();
 
         double currentTime() const;

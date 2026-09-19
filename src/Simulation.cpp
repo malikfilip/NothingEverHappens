@@ -34,15 +34,22 @@ namespace simulator {
         std::push_heap(event_queue_.begin(), event_queue_.end(), laterEvent);
     }
 
+    bool Simulation::step()
+    {
+        if (event_queue_.empty()) return false;
+
+        std::pop_heap(event_queue_.begin(), event_queue_.end(), laterEvent);
+        auto event = std::move(event_queue_.back());
+        event_queue_.pop_back();
+
+        current_time_ = event->time();
+        executeEvent(*event);
+        return true;
+    }
+
     void Simulation::run()
     {
-        while (!event_queue_.empty()) {
-            std::pop_heap(event_queue_.begin(), event_queue_.end(), laterEvent);
-            auto event = std::move(event_queue_.back());
-            event_queue_.pop_back();
-
-            current_time_ = event->time();
-            executeEvent(*event);
+        while (step()) {
         }
     }
 

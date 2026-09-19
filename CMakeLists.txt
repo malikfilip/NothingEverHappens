@@ -30,6 +30,11 @@ target_include_directories(bittorrent_simulator PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(simulation_tests tests/SimulationTests.cpp src/Simulation.cpp)
+    target_include_directories(simulation_tests PRIVATE inc)
+    add_test(NAME simulation COMMAND simulation_tests)
+endif()
+if(BUILD_TESTING)
     add_executable(message_delivery_tests
         tests/MessageDeliveryTests.cpp
         src/Simulation.cpp
