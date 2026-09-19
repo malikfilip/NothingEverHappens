@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/">
+        <file>resources/nodes/tracker.png</file>
+    </qresource>
+</RCC>
