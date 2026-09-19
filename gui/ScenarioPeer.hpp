@@ -10,6 +10,7 @@ struct ScenarioPeer {
     quint64 id = 0;
     QString name;
     Role initialRole = Role::Leecher;
+    bool initiallyJoined = false; // Scenario configuration, not runtime membership.
     quint64 initialPieceCount = 0;
     quint64 uploadBytesPerSecond = 0;
     quint64 downloadBytesPerSecond = 0;

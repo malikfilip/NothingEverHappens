@@ -20,9 +20,12 @@ public:
     std::function<void(quint64, const ScenarioPeer&)> peerPlaced;
     std::function<void(quint64, quint64, QPointF)> peerMoved;
     std::function<void(quint64, quint64)> peerRemoved;
+    std::function<void(quint64, quint64, bool)> peerInitiallyJoinedChanged;
+    std::function<void(quint64, QPointF)> trackerMoved;
     std::function<void()> placementChanged;
 
 protected:
+    void resizeEvent(QResizeEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
@@ -32,6 +35,7 @@ protected:
 private:
     PeerNode* addPeerNode(const ScenarioPeer& peer);
     void updatePreview(const QPoint& viewportPosition);
+    void updateCanvasRect();
     quint64 swarmId_ = 0;
     std::optional<ScenarioPeer> pendingPeer_;
     PeerNode* preview_ = nullptr;

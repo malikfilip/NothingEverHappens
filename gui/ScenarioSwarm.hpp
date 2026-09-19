@@ -17,6 +17,7 @@ struct ScenarioSwarm {
     quint64 pieceSizeBytes = 0;
     quint64 pieceCount = 0;
     std::vector<ScenarioPeer> peers;
+    QPointF trackerPosition; // Visualization only; independent for each swarm.
 
     // Presentation metadata; byte fields above remain authoritative for calculations.
     QString virtualSizeDisplayValue;

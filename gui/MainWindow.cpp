@@ -58,6 +58,15 @@ MainWindow::MainWindow(QWidget* parent)
         if (auto* swarm = findSwarm(swarmId))
             std::erase_if(swarm->peers, [peerId](const ScenarioPeer& peer) { return peer.id == peerId; });
     };
+    canvas_->peerInitiallyJoinedChanged = [this](quint64 swarmId, quint64 peerId, bool joined) {
+        if (auto* swarm = findSwarm(swarmId)) {
+            for (auto& peer : swarm->peers)
+                if (peer.id == peerId) { peer.initiallyJoined = joined; break; }
+        }
+    };
+    canvas_->trackerMoved = [this](quint64 swarmId, QPointF position) {
+        if (auto* swarm = findSwarm(swarmId)) swarm->trackerPosition = position;
+    };
     canvas_->placementChanged = [this] {
         addPeerAction_->setEnabled(swarmSelector_->currentIndex() >= 0 && !canvas_->isPlacingPeer());
         canvas_->setToolTip(canvas_->isPlacingPeer()
