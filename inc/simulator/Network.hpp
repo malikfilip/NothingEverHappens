@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <functional>
 #include <optional>
 #include <map>
 #include <set>
@@ -33,6 +34,13 @@ namespace simulator {
         LifecycleContext lifecycle;
     };
 
+    struct LinkConfig {
+        double bandwidth; // Bits per simulation second; finite and positive.
+        double latency; // Simulation seconds; finite and nonnegative.
+    };
+
+    using LinkConfigProvider = std::function<LinkConfig(PeerId, PeerId)>;
+
     struct JoinOptions {
         std::size_t numwant = 50;
         std::size_t targetOutgoingConnections = 8;
@@ -52,6 +60,12 @@ namespace simulator {
         LifecycleContext lifecycleContext(SwarmId swarmId, PeerId sender, PeerId receiver) const;
         bool lifecycleCurrent(SwarmId swarmId, PeerId peer, std::uint64_t generation) const;
         bool messageStale(SwarmId swarmId, PeerId sender, PeerId receiver, LifecycleContext context) const;
+
+        // Optional configuration for missing physical paths admitted by discovery.
+        // Called with initiator/remote IDs, never for an existing Link. Empty disables creation.
+        // Invalid configuration rejects the attempt; provider exceptions propagate.
+        // The provider must not mutate this Network during the callback.
+        void setLinkConfigProvider(LinkConfigProvider provider);
 
         // Tracker-initiated target per peer/swarm (default 8); zero still allows incoming relationships.
         // Rejects a target below live plus pending self-initiated relationships.
@@ -149,6 +163,7 @@ namespace simulator {
         void validateTrackerSetup() const;
         std::set<PeerId> neighbors(SwarmId swarmId, PeerId peer) const;
         bool tryConnectPeer(SwarmId swarmId, PeerId local, PeerId remote);
+        LinkConfigProvider link_config_provider_;
         Tracker tracker_;
         std::map<std::pair<PeerId, SwarmId>, DiscoveryState> discovery_;
         Simulation& simulation_;

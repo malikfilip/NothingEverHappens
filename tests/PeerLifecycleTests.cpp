@@ -60,6 +60,75 @@ void drained(const Network& net, unsigned count) {
         check(!state.active && state.pendingCount == 0, "FIFO leaked");
     }
 }
+void independentPeriodicNumwant() {
+    const Swarm swarm(1, InfoHash{1}, 1), other(2, InfoHash{2}, 1);
+    auto members = makePeers(6);
+    for (auto& peer : members) {
+        if (peer.id() != 1) peer.joinSwarm(swarm);
+        peer.joinSwarm(other);
+    }
+    Simulation sim(false, 12345);
+    Network net(sim, std::move(members), {}, {swarm, other}, 50, 2);
+    Tracker expected(50, 12345, 2);
+    for (PeerId id = 2; id <= 6; ++id) {
+        net.announceToTracker(1, id, 0);
+        expected.announce(swarm.infoHash(), id, 0);
+    }
+    for (PeerId id = 1; id <= 5; ++id) {
+        net.announceToTracker(2, id, 0);
+        expected.announce(other.infoHash(), id, 0);
+    }
+    const auto started = expected.announce(swarm.infoHash(), 1, 3, AnnounceKind::Started);
+    const auto regular = expected.announce(swarm.infoHash(), 1, 3);
+    expected.announce(swarm.infoHash(), 1, 3); // At capacity, still sample all three.
+    const auto probe = expected.announce(other.infoHash(), 6, 1);
+    std::vector<PeerId> startedCalls, regularCalls;
+    unsigned probeCalls = 0;
+    net.setLinkConfigProvider([&](PeerId from, PeerId to) {
+        if (sim.currentTime() == 0) {
+            check(from == 1, "Unexpected STARTED initiator");
+            startedCalls.push_back(to);
+            return LinkConfig{0, 0}; // See every candidate without using any slots.
+        }
+        if (sim.currentTime() == 2) {
+            check(from == 1, "Unexpected regular initiator");
+            regularCalls.push_back(to);
+            return LinkConfig{regularCalls.size() == 1 ? 0.0 : 1000000.0, .01};
+        }
+        check(near(sim.currentTime(), 4.5) && from == 6 && to == probe.front(),
+            "Full-target announce changed configured numwant/RNG sampling");
+        ++probeCalls;
+        return LinkConfig{1000000, .01};
+    });
+    net.joinSwarm(1, 1, JoinOptions{3, 1, std::nullopt});
+    at(sim, .5, [&] {
+        check(startedCalls == started, "STARTED numwant was clamped to outgoing slots");
+        check(net.peer(1).swarmState(1).connections.empty(), "Invalid configuration admitted a connection");
+    });
+    at(sim, 2.5, [&] {
+        check(regularCalls == std::vector<PeerId>({regular[0], regular[1]}),
+            "Regular announce did not try beyond the first rejected candidate");
+        const auto& connections = net.peer(1).swarmState(1).connections;
+        check(connections.size() == 1 && connections.at(regular[1]).handshakeComplete(),
+            "Outgoing target not enforced independently of numwant");
+        for (const auto id : regular) {
+            if (id != regular[1]) rejects([&] { net.transmissionState(1, id); });
+        }
+    });
+    at(sim, 4.5, [&] {
+        check(regularCalls.size() == 2, "Full outgoing target created another path");
+        // Tracker has one seeded RNG across swarms: this checks that even the
+        // full-target regular announce sampled configured numwant, not zero.
+        net.announceToTracker(2, 6, 1);
+    });
+    at(sim, 5, [&] {
+        check(probeCalls == 1 && net.peer(6).swarmState(2).connections.at(probe.front()).handshakeComplete(),
+            "Post-periodic tracker RNG probe failed");
+    });
+    leaveAt(sim, net, 5.5, 1);
+    sim.run();
+    check(net.activeTransmissions().empty(), "Lazy periodic transmissions leaked");
+}
 void runtimeJoin() {
     Swarm swarm(1, InfoHash{1}, 1);
     Simulation sim(false, 7);
@@ -670,6 +739,7 @@ void partialDataRejoin() {
 }
 int main() {
     const std::pair<const char*, void(*)()> tests[] = {
+        {"Periodic numwant is independent of outgoing slots, including full-target sampling", independentPeriodicNumwant},
         {"Runtime join, observability, periodic discovery and exact single-chain timing", runtimeJoin},
         {"Runtime join through STARTED discovery completes automatic download and drains", runtimeDownload},
         {"Late STARTED discovers existing peer", lateStarted},

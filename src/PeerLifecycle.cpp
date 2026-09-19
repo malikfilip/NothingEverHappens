@@ -88,8 +88,6 @@ void Network::processTrackerAnnounce(SwarmId swarmId, PeerId local, std::size_t 
         if (!std::isfinite(next) || next <= simulation_.currentTime())
             throw std::invalid_argument("Tracker interval cannot advance simulation time");
         discovery.nextAnnounce.reset();
-        const auto used = discovery.initiatedNeighbors.size();
-        numwant = std::min(numwant, used < discovery.targetOutgoingConnections ? discovery.targetOutgoingConnections - used : 0);
     }
     for (const auto remote : tracker_.announce(swarm(swarmId).infoHash(), local, numwant, kind))
         tryConnectPeer(swarmId, local, remote);

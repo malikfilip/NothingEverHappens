@@ -5,8 +5,13 @@
 #include <cmath>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 namespace simulator {
+    void Network::setLinkConfigProvider(LinkConfigProvider provider) {
+        link_config_provider_ = std::move(provider);
+    }
+
     void Network::validateTrackerSetup() const {
         std::map<InfoHash, SwarmId> hashes;
         for (const auto& swarm : swarms_) {
@@ -55,12 +60,18 @@ namespace simulator {
             return (link.endpointA() == local && link.endpointB() == remote)
                 || (link.endpointA() == remote && link.endpointB() == local);
         });
-        if (path == links_.end()) return false;
-        // Both handshake directions must be able to use the existing transport.
-        for (const double rate : {path->bandwidth(), peer(local).uploadCapacity(), peer(local).downloadCapacity(),
+        const bool missingPath = path == links_.end();
+        if (missingPath && !link_config_provider_) return false;
+        // Both handshake directions must be usable before creating a physical path.
+        for (const double rate : {peer(local).uploadCapacity(), peer(local).downloadCapacity(),
                                  peer(remote).uploadCapacity(), peer(remote).downloadCapacity()})
             if (!std::isfinite(rate) || rate <= 0) return false;
-        if (!std::isfinite(path->latency()) || path->latency() < 0) return false;
+        const LinkConfig config = missingPath ? link_config_provider_(local, remote)
+            : LinkConfig{path->bandwidth(), path->latency()};
+        if (!std::isfinite(config.bandwidth) || config.bandwidth <= 0
+            || !std::isfinite(config.latency) || config.latency < 0) return false;
+        // Append only: active transmissions and scheduled events retain their link indices.
+        if (missingPath) links_.emplace_back(local, remote, config.bandwidth, config.latency);
         auto event = std::make_unique<SendMessageEvent>(simulation_.currentTime(), *this, swarmId, local, remote,
             Message(MessageType::Handshake, HandshakePayload{swarm(swarmId).infoHash(), peer(local).protocolId()}));
         try {
