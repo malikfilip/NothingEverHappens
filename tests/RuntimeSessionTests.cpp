@@ -2,6 +2,8 @@
 #include "ScenarioPieces.hpp"
 #include "PeerInspection.hpp"
 #include "simulator/TrackerAnnounceEvent.hpp"
+#include "simulator/RechokeEvent.hpp"
+#include "simulator/TransmissionStartEvent.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -218,6 +220,72 @@ void blockConfigurationAndInspection()
     check(session->network().links().size() == 1, "Inspection changed lazy link topology");
 }
 
+void settingsSnapshot()
+{
+    ScenarioSettings settings;
+    check(settings.bitTorrent.regularRechokeInterval == 10.0
+        && settings.bitTorrent.optimisticUnchokeInterval == 30.0, "Settings defaults");
+    for (double optimistic : {10.0, 25.0, 30.0}) {
+        settings.bitTorrent = {10.0, optimistic};
+        check(!settings.bitTorrent.validationError(), "Valid independent intervals rejected");
+    }
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double infinity = std::numeric_limits<double>::infinity();
+    for (const BitTorrentSettings invalid : {BitTorrentSettings{0, 30}, {-1, 30},
+            {10, 0}, {10, -1}, {10, 5}, {nan, 30}, {10, nan}, {infinity, infinity}, {10, infinity}}) {
+        check(invalid.validationError(), "Invalid settings accepted");
+        auto input = scenario();
+        bool rejected = false;
+        try { RuntimeSession::create(input, {0, 0, 100, 100}, 0, {invalid}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "Runtime accepted invalid settings");
+    }
+    auto input = scenario();
+    settings.bitTorrent = {10.0, 25.0};
+    auto session = RuntimeSession::create(input, {0, 0, 100, 100}, 0, settings);
+    settings.bitTorrent = {2.0, 5.0};
+    check(session->settings().bitTorrent.regularRechokeInterval == 10.0
+        && session->settings().bitTorrent.optimisticUnchokeInterval == 25.0,
+        "Runtime settings were not independently snapshotted");
+}
+
+void settingsReachChoking()
+{
+    auto s = swarm(1, 1024);
+    s.peers = {peer(1, true, ScenarioPeer::Role::Seeder, 1024),
+        peer(2, true, ScenarioPeer::Role::Leecher, 0)};
+    // Keep transfer useful through several configured decisions.
+    for (auto& p : s.peers) p.uploadBytesPerSecond = p.downloadBytesPerSecond = 1024;
+    std::vector<ScenarioSwarm> input{s};
+    auto session = RuntimeSession::create(input, {0,0,100,100}, 0, {{5,25}});
+    check(session->network().bitTorrentSettings().regularRechokeInterval == 5
+        && session->network().bitTorrentSettings().optimisticUnchokeInterval == 25, "Settings did not reach Network");
+    std::vector<double> decisions;
+    std::optional<double> firstPiece;
+    session->simulation().setEventObserver([&](const simulator::Event& e) {
+        if (const auto* transfer = dynamic_cast<const simulator::TransmissionStartEvent*>(&e);
+            transfer && transfer->message().type() == simulator::MessageType::Piece && !firstPiece)
+            firstPiece = e.time();
+        if (const auto* r = dynamic_cast<const simulator::RechokeEvent*>(&e);
+            r && r->peerId() == 1 && r->regularDue()) decisions.push_back(e.time());
+    });
+    std::optional<double> start;
+    bool bootstrap = false;
+    for (unsigned steps = 0; steps < 10000 && decisions.size() < 3; ++steps) {
+        check(session->simulation().step(), "Unexpectedly drained settings integration");
+        const auto& state = session->network().peer(1).swarmState(1);
+        if (state.choking.cycleActive && !start) {
+            start = state.choking.cycleStart;
+            bootstrap = !state.connections.at(2).weAreChokingRemote;
+            check(near(state.choking.nextRegularDeadline, *start + 5), "First deadline not local");
+        }
+    }
+    check(start && bootstrap && decisions.size() == 3, "Bootstrap/regular integration missing");
+    check(firstPiece && *firstPiece < *start + 5, "Transfer waited for the first regular deadline");
+    for (std::size_t i = 0; i < decisions.size(); ++i)
+        check(near(decisions[i], *start + 5 * (i + 1)), "Configured 5-second cadence ignored");
+}
+
 void deterministicOwnershipAndGeometry()
 {
     auto original = scenario(), first = original, second = original;
@@ -262,6 +330,8 @@ void deterministicOwnershipAndGeometry()
 int main()
 {
     try {
+        settingsSnapshot();
+        settingsReachChoking();
         preflight();
         validationAndTransaction();
         materializationAndLifecycle();

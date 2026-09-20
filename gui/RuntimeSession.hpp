@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ScenarioSwarm.hpp"
+#include "ScenarioSettings.hpp"
 #include "simulator/Network.hpp"
 #include "simulator/Simulation.hpp"
 #include <QRectF>
@@ -35,7 +36,7 @@ public:
     static PlayPreflight preflight(const std::vector<ScenarioSwarm>& scenario);
     // Strong transaction: scenario ownership is published only after complete startup.
     static std::unique_ptr<RuntimeSession> create(std::vector<ScenarioSwarm>& scenario,
-        const QRectF& visibleCanvas, std::uint64_t seed = 0);
+        const QRectF& visibleCanvas, std::uint64_t seed = 0, ScenarioSettings settings = {});
 
     RuntimeSession(const RuntimeSession&) = delete;
     RuntimeSession& operator=(const RuntimeSession&) = delete;
@@ -45,11 +46,14 @@ public:
     simulator::Simulation& simulation() { return simulation_; }
     const simulator::Simulation& simulation() const { return simulation_; }
     const simulator::Network& network() const { return *network_; }
+    const ScenarioSettings& settings() const { return settings_; }
     const auto& swarmIds() const { return swarmIds_; }
     const auto& peerBindings() const { return peerBindings_; }
 
 private:
-    RuntimeSession(std::vector<ScenarioSwarm>& scenario, const QRectF& canvas, std::uint64_t seed);
+    RuntimeSession(std::vector<ScenarioSwarm>& scenario, const QRectF& canvas, std::uint64_t seed,
+        ScenarioSettings settings);
+    const ScenarioSettings settings_;
     // Declaration order ensures Simulation outlives Network and its engine references.
     simulator::Simulation simulation_;
     std::map<quint64, simulator::SwarmId> swarmIds_;

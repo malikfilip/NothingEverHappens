@@ -73,7 +73,7 @@ provider geometry.
 
 Successful startup enters runtime mode, disables Play/Add Swarm/Add Peer and
 canvas editing/context actions, and preserves viewing/swarm selection/help.
-The title reports RUNNING or PAUSED. Stop and Next remain disabled. Pause and
+The title reports RUNNING or PAUSED. Stop remains disabled. Next Event executes one queued event while paused. Pause and
 Resume control the event pump. Closing the application releases the session;
 no Stop or reset behavior is simulated.
 
@@ -124,10 +124,7 @@ notifications in dispatch order. It does not imply post-event success or inspect
 post-event state. Stale/no-op events may therefore appear. The log clears only
 on new session creation, preserves entries across Pause/Resume, and scrolls to
 the bottom after each step. It retains at most 2,000 rows, removing the oldest
-GUI row before appending; the engine is unaffected. Toolbar time is refreshed
-after each successful step, displaying actual engine time as total minutes:ss.mmm
-(starting at 00:00.000, without wrapping at an hour). It stays fixed during waits
-and Pause. Message Filter remains disconnected.
+GUI row before appending; the engine is unaffected. Toolbar time displays GUI playback time as total minutes:ss.mmm. It advances between events while running and freezes on Pause. Message Filter remains disconnected.
 
 runtime_pump_tests uses QCoreApplication without widgets or GUI interaction to
 exercise real recurring tracker events, bounded callbacks, pause/resume identity
@@ -160,3 +157,48 @@ updates while visible. Its row-scrolled grid paints only visible cells, with no
 per-piece widgets and zero-based index/ownership tooltips. Clearing selection hides
 it. Old scenarios lacking concrete inventory show an explicit unavailable message
 until prepared; opening the dialog never randomizes ownership.
+
+## Simulation settings
+
+The last toolbar action opens a modal Simulation Settings dialog in EDIT mode.
+MainWindow owns scenario-wide ScenarioSettings, separate from the swarm list.
+Its BitTorrent settings default to regular rechoke = 10 s and optimistic unchoke
+= 30 s. Both must be finite and positive, with optimistic >= regular; no
+integer-multiple constraint applies. The dialog supports 0.001..86400 seconds
+with millisecond precision and commits only on valid OK. Cancel discards edits.
+
+RuntimeSession validates and stores an immutable copy at creation. Settings are
+disabled whenever a session exists, including pause/error states. Stop remains
+unimplemented. The shared engine BitTorrentSettings type reaches Network through
+RuntimeSession and controls bootstrap plus peer/swarm-local choking deadlines.
+For regular=5, first actionable interest at T immediately fills available upload
+slots, with full preferred decisions at T+5, T+10, T+15. Optimistic timing is
+independent (for example 5/25). Simulation has no BitTorrent-specific fields.
+
+## Continuous playback display
+
+The GUI-only PlaybackClock advances with QElapsedTimer at the selected speed.
+RuntimePump refreshes displayed Sim Time on a dedicated 16 ms presentation timer,
+clamped between current engine time and the next queued event. Simulation::step()
+runs only once the paced clock reaches that timestamp. Max retains rapid event
+processing with periodic UI yields. No display update creates an engine event
+or an Event Log entry; Simulation::currentTime() remains discrete engine time.
+
+Pause freezes playback progress; resume retains progress toward the same event.
+Next Event is enabled only while paused with a queued event. It executes exactly
+one step (preserving equal-time ordering), resets playback to that event's time,
+and stays paused. Empty queues and execution errors leave playback paused.
+## Download completion notifications
+
+Network dispatches PeerCompletedEvent synchronously through Simulation::executeNow
+when a newly owned piece makes the receiver own every piece. It carries actual
+engine time and peer/swarm IDs and appears as PEER_COMPLETED in the existing log.
+It changes no protocol state and adds no queued event. Already-complete seeds
+and retired/duplicate PIECEs do not generate completion notifications.
+
+MainWindow queues names from these notifications, refreshes the existing peer
+colors after the atomic step, and pauses before showing one asynchronous modal
+popup at a time. Continue (or closing the popup) resumes only after the queue is
+empty and only if the run was active before presentation. Completion reached by
+paused Next Event stays paused. Stop Simulation is disabled because central Stop
+semantics are not implemented.

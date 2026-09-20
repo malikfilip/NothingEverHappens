@@ -11,6 +11,7 @@
 #include "simulator/Peer.hpp"
 #include "simulator/Swarm.hpp"
 #include "simulator/Tracker.hpp"
+#include "simulator/BitTorrentSettings.hpp"
 
 namespace simulator {
 
@@ -50,7 +51,7 @@ namespace simulator {
     class Network {
     public:
         // Simulation must outlive this network, which owns its peers, links, and swarms.
-        Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms = {}, std::size_t trackerMaximum = 50, double trackerInterval = 1800);
+        Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms = {}, std::size_t trackerMaximum = 50, double trackerInterval = 1800, BitTorrentSettings settings = {});
 
         // Runtime APIs execute atomically at current simulation time.
         void joinSwarm(SwarmId swarmId, PeerId peer, JoinOptions options = {});
@@ -87,6 +88,7 @@ namespace simulator {
         const std::vector<Swarm>& swarms() const { return swarms_; }
         const std::vector<Link>& links() const { return links_; }
         const Tracker& tracker() const { return tracker_; }
+        const BitTorrentSettings& bitTorrentSettings() const { return bitTorrentSettings_; }
 
         // Physical unordered endpoint pair; nullptr if absent. Never creates a Link.
         // The pointer may be invalidated by lazy Link creation.
@@ -124,14 +126,18 @@ namespace simulator {
             std::uint64_t generation, bool periodic, double eventTime);
         void scheduleTrackerAnnounce(SwarmId swarmId, PeerId peer, AnnounceKind kind, double time);
         void scheduleRechoke(PeerId local, SwarmId swarmId);
-        void rechoke(PeerId local, SwarmId swarmId);
+        void rechoke(PeerId local, SwarmId swarmId, std::uint64_t cycle, double deadline);
+        void updateChoking(PeerId local, SwarmId swarmId);
+        std::vector<PeerId> rankedInterested(PeerId local, SwarmId swarmId) const;
+        void fillChokingSlots(PeerId local, SwarmId swarmId, bool rotateOptimistic = false);
+        void applyChoking(PeerId local, SwarmId swarmId);
         bool hasUsefulExchange(PeerId local, SwarmId swarmId) const;
         static bool ownsAll(const Swarm& swarm, const PeerSwarmState& state);
         static std::optional<PeerId> selectOptimistic(std::vector<PeerId> eligible,
                                                     std::optional<PeerId> previous);
         void setChoking(PeerId local, SwarmId swarmId, PeerId remote, bool choke);
         void recordUsefulPiece(PeerId sender, PeerId receiver, SwarmId swarmId, std::uint64_t bytes);
-        void enforceInterestedLimit(PeerId local, SwarmId swarmId);
+
         // Network owns multiple peers, so the local requester is explicit.
         void tryScheduleRequests(Peer& requester, SwarmId swarmId, PeerId remotePeerId);
         static bool endgameReady(const Swarm& swarm, const PeerSwarmState& state);
@@ -176,6 +182,7 @@ namespace simulator {
         std::set<PeerId> neighbors(SwarmId swarmId, PeerId peer) const;
         bool tryConnectPeer(SwarmId swarmId, PeerId local, PeerId remote);
         LinkConfigProvider link_config_provider_;
+        const BitTorrentSettings bitTorrentSettings_;
         Tracker tracker_;
         std::map<std::pair<PeerId, SwarmId>, DiscoveryState> discovery_;
         Simulation& simulation_;

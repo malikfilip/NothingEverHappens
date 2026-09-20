@@ -1,4 +1,6 @@
 #include "MainWindow.hpp"
+#include "simulator/PeerCompletedEvent.hpp"
+#include "SimulationSettingsDialog.hpp"
 #include "MessageInfoDialog.hpp"
 #include "AddSwarmDialog.hpp"
 #include "AddPeerDialog.hpp"
@@ -11,6 +13,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include <QAction>
 #include <QCheckBox>
@@ -18,6 +21,9 @@
 #include <QGroupBox>
 #include <QGridLayout>
 #include <QPixmap>
+#include <QPainter>
+#include <QPainterPath>
+#include <QSizePolicy>
 #include <QDialogButtonBox>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -37,6 +43,31 @@
 #include <QVBoxLayout>
 
 namespace {
+QIcon settingsIcon(const QPalette& palette)
+{
+    // QStyle has no portable gear icon. Paint a palette-aware fallback using Qt.
+    QPixmap pixmap(64, 64);
+    pixmap.setDevicePixelRatio(2);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+    QPainterPath gear;
+    constexpr double pi = 3.14159265358979323846;
+    for (int i = 0; i < 32; ++i) {
+        const double angle = i * 2 * pi / 32;
+        const double radius = i % 4 == 0 || i % 4 == 3 ? 10.0 : 14.0;
+        const QPointF point(16 + radius * std::cos(angle), 16 + radius * std::sin(angle));
+        if (i == 0) gear.moveTo(point);
+        else gear.lineTo(point);
+    }
+    gear.closeSubpath();
+    gear.addEllipse(QPointF(16, 16), 5, 5);
+    gear.setFillRule(Qt::OddEvenFill);
+    painter.fillPath(gear, palette.color(QPalette::ButtonText));
+    painter.end();
+    return QIcon::fromTheme(QStringLiteral("preferences-system"), QIcon(pixmap));
+}
+
 QString simulationTimeText(double time)
 {
     // Unbounded total minutes; seconds/milliseconds conversions stay bounded.
@@ -57,17 +88,26 @@ MainWindow::MainWindow(QWidget* parent)
     resize(1280, 820);
     setMinimumSize(640, 480);
     createToolbar();
-    pump_.stateChanged = [this] { updateRuntimeControls(); };
+    pump_.playbackChanged = [this] {
+        simulationTime_->setText(simulationTimeText(pump_.playbackTime()));
+    };
+    pump_.stateChanged = [this] {
+        updateRuntimeControls();
+        pump_.playbackChanged();
+    };
     pump_.stepped = [this] {
-        simulationTime_->setText(simulationTimeText(runtime_->simulation().currentTime()));
+        simulationTime_->setText(simulationTimeText(pump_.playbackTime()));
         eventLog_->scrollToBottom();
         refreshInspector();
+        presentCompletions();
     };
     pump_.failed = [this](const char* message) {
-        simulationTime_->setText(simulationTimeText(runtime_->simulation().currentTime()));
+        simulationTime_->setText(simulationTimeText(pump_.playbackTime()));
         eventLog_->scrollToBottom();
         refreshInspector();
         QMessageBox::critical(this, tr("Simulation paused after an error"), QString::fromUtf8(message));
+        resumeAfterCompletions_ = false;
+        presentCompletions();
     };
 
     auto* canvasPanel = new QGroupBox(tr("Simulation Canvas"));
@@ -166,7 +206,9 @@ void MainWindow::createToolbar()
     pauseAction_ = toolbar->addAction(style()->standardIcon(QStyle::SP_MediaPause), tr("Pause"));
     pauseAction_->setEnabled(false);
     connect(pauseAction_, &QAction::triggered, this, [this] { pump_.pause(); });
-    disable(toolbar->addAction(style()->standardIcon(QStyle::SP_MediaSkipForward), tr("Next Event")));
+    nextEventAction_ = toolbar->addAction(style()->standardIcon(QStyle::SP_MediaSkipForward), tr("Next Event"));
+    nextEventAction_->setEnabled(false);
+    connect(nextEventAction_, &QAction::triggered, this, [this] { pump_.nextEvent(); });
     toolbar->addSeparator();
 
     auto* speedLabel = new QLabel(tr("Speed:"), toolbar);
@@ -203,6 +245,12 @@ void MainWindow::createToolbar()
     swarmInfo_ = toolbar->addAction(tr("Swarm Info"));
     swarmInfo_->setEnabled(false);
     connect(swarmInfo_, &QAction::triggered, this, &MainWindow::showSwarmInfo);
+    auto* spacer = new QWidget(toolbar);
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolbar->addWidget(spacer);
+    settingsAction_ = toolbar->addAction(settingsIcon(palette()), tr("Settings"));
+    settingsAction_->setObjectName("simulationSettingsAction");
+    connect(settingsAction_, &QAction::triggered, this, &MainWindow::showSettings);
     connect(swarmSelector_, &QComboBox::currentIndexChanged, this, [this](int index) {
         const bool active = index >= 0 && static_cast<std::size_t>(index) < swarms_.size();
         swarmInfo_->setEnabled(active);
@@ -212,6 +260,13 @@ void MainWindow::createToolbar()
             refreshInspector();
         }
     });
+}
+
+void MainWindow::showSettings()
+{
+    if (runtime_) return;
+    SimulationSettingsDialog dialog(settings_, this);
+    if (dialog.exec() == QDialog::Accepted) settings_ = dialog.settings();
 }
 
 QWidget* MainWindow::createInspector()
@@ -466,7 +521,7 @@ void MainWindow::play()
     try {
         const auto canvasRect = canvas_->viewportTransform().inverted()
             .mapRect(QRectF(canvas_->viewport()->rect()));
-        runtime_ = RuntimeSession::create(swarms_, canvasRect, scenarioSeed_);
+        runtime_ = RuntimeSession::create(swarms_, canvasRect, scenarioSeed_, settings_);
     } catch (const std::exception& error) {
         showError(tr("Could not create the runtime session:\n%1").arg(QString::fromUtf8(error.what())));
         return;
@@ -476,6 +531,8 @@ void MainWindow::play()
     addPeerAction_->setEnabled(false);
     eventLogModel_->removeRows(0, eventLogModel_->rowCount());
     runtime_->simulation().setEventObserver([this](const simulator::Event& event) {
+        if (const auto* completed = dynamic_cast<const simulator::PeerCompletedEvent*>(&event))
+            queueCompletion(completed->peerId(), completed->swarmId());
         // Pre-execution notification, including synchronous executeNow dispatches.
         // Copy descriptions only; never infer post-event state or retain references.
         constexpr int maximumLogRows = 2000;
@@ -488,12 +545,70 @@ void MainWindow::play()
     pump_.start(runtime_->simulation());
 }
 
+void MainWindow::queueCompletion(simulator::PeerId peerId, simulator::SwarmId swarmId)
+{
+    // Capture names now; do not retain engine-event references or infer from colors.
+    for (const auto& [scenarioPeerId, binding] : runtime_->peerBindings()) {
+        if (binding.peerId != peerId || binding.swarmId != swarmId) continue;
+        if (const auto* swarm = findSwarm(binding.scenarioSwarmId)) {
+            for (const auto& peer : swarm->peers) {
+                if (peer.id == scenarioPeerId) {
+                    completionMessages_.push_back(tr("Peer %1 has finished downloading %2.")
+                        .arg(peer.name, swarm->name));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+void MainWindow::presentCompletions()
+{
+    if (presentingCompletions_ || completionMessages_.empty()) return;
+    presentingCompletions_ = true;
+    resumeAfterCompletions_ = pump_.state() == RuntimePump::State::Running;
+    pump_.pause();
+    updateRuntimeControls();
+    // Leave the atomic engine step and its observer before entering any dialog.
+    QTimer::singleShot(0, this, [this] { showNextCompletion(); });
+}
+
+void MainWindow::showNextCompletion()
+{
+    if (completionMessages_.empty()) {
+        presentingCompletions_ = false;
+        const bool resume = std::exchange(resumeAfterCompletions_, false);
+        if (resume) pump_.resume();
+        else updateRuntimeControls();
+        return;
+    }
+    auto* popup = new QMessageBox(QMessageBox::Information, tr("Download complete"),
+        completionMessages_.front(), QMessageBox::NoButton, this);
+    completionMessages_.pop_front();
+    popup->setTextFormat(Qt::PlainText);
+    popup->setWindowModality(Qt::ApplicationModal);
+    popup->setAttribute(Qt::WA_DeleteOnClose);
+    auto* proceed = popup->addButton(tr("Continue"), QMessageBox::AcceptRole);
+    popup->setDefaultButton(proceed);
+    popup->setEscapeButton(proceed);
+    auto* stop = popup->addButton(tr("Stop Simulation"), QMessageBox::DestructiveRole);
+    stop->setEnabled(false);
+    stop->setToolTip(tr("Stop Simulation is not implemented yet."));
+    connect(popup, &QDialog::finished, this, [this] {
+        QTimer::singleShot(0, this, [this] { showNextCompletion(); });
+    });
+    popup->open();
+}
+
 void MainWindow::updateRuntimeControls()
 {
     const auto state = pump_.state();
-    playAction_->setEnabled(state != RuntimePump::State::Running && !canvas_->isPlacingPeer());
+    settingsAction_->setEnabled(!runtime_ && state == RuntimePump::State::Edit);
+    playAction_->setEnabled(state != RuntimePump::State::Running && !presentingCompletions_ && !canvas_->isPlacingPeer());
     playAction_->setText(state == RuntimePump::State::Paused ? tr("Resume") : tr("Play"));
     pauseAction_->setEnabled(state == RuntimePump::State::Running);
+    nextEventAction_->setEnabled(state == RuntimePump::State::Paused && !presentingCompletions_ && runtime_
+        && runtime_->simulation().nextEventTime().has_value());
     setWindowTitle(state == RuntimePump::State::Edit ? tr("picoTorrent Simulator - EDIT")
         : state == RuntimePump::State::Running ? tr("picoTorrent Simulator - RUNNING")
         : tr("picoTorrent Simulator - PAUSED"));

@@ -78,6 +78,8 @@ void autonomousFourPeerRing(bool tracing)
 
     struct PendingSend { PeerId sender, receiver; Enqueued message; std::size_t queuedBefore; };
     std::optional<PendingSend> pendingSend;
+    std::array<std::array<bool, 5>, 5> wasChoking;
+    for (auto& row : wasChoking) row.fill(true);
     auto finishSend = [&](const Event* next) {
         if (!pendingSend) return;
         const auto pending = *pendingSend;
@@ -97,6 +99,15 @@ void autonomousFourPeerRing(bool tracing)
     simulation.setEventObserver([&](const Event& event) {
         // Observers run BEFORE execution. Confirm enqueue at the next callback,
         // or at the nested immediate start; canceled send events enqueue nothing.
+        // Policy CHOKE purges queued PIECEs, while active and propagating traffic
+        // remains valid. Mirror that documented removal in the FIFO oracle.
+        for (PeerId local = 1; local <= 4; ++local)
+            for (const auto& [remote, connection] : network.peer(local).swarmState(1).connections) {
+                if (connection.weAreChokingRemote && !wasChoking[local][remote])
+                    std::erase_if(directions[local][remote].queued,
+                        [](const Enqueued& queued) { return queued.type == MessageType::Piece; });
+                wasChoking[local][remote] = connection.weAreChokingRemote;
+            }
         finishSend(&event);
         std::array<double, 5> outgoing{}, incoming{};
         for (const auto& [id, active] : network.activeTransmissions()) {

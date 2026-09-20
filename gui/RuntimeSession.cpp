@@ -96,8 +96,9 @@ PlayPreflight RuntimeSession::preflight(const std::vector<ScenarioSwarm>& scenar
 }
 
 std::unique_ptr<RuntimeSession> RuntimeSession::create(std::vector<ScenarioSwarm>& scenario,
-                                                     const QRectF& canvas, std::uint64_t seed)
+                                                     const QRectF& canvas, std::uint64_t seed, ScenarioSettings settings)
 {
+    if (const auto* error = settings.bitTorrent.validationError()) throw std::invalid_argument(error);
     const auto validation = preflight(scenario);
     if (!validation.errors.isEmpty()) throw std::invalid_argument(validation.errors.join('\n').toStdString());
     if (!std::isfinite(canvas.x()) || !std::isfinite(canvas.y())
@@ -105,13 +106,13 @@ std::unique_ptr<RuntimeSession> RuntimeSession::create(std::vector<ScenarioSwarm
         || canvas.width() <= 0 || canvas.height() <= 0)
         throw std::invalid_argument("Canvas dimensions must be finite and positive.");
     auto prepared = scenario;
-    auto session = std::unique_ptr<RuntimeSession>(new RuntimeSession(prepared, canvas, seed));
+    auto session = std::unique_ptr<RuntimeSession>(new RuntimeSession(prepared, canvas, seed, settings));
     scenario.swap(prepared);
     return session;
 }
 
-RuntimeSession::RuntimeSession(std::vector<ScenarioSwarm>& scenario, const QRectF& canvas, std::uint64_t seed)
-    : simulation_(false, seed)
+RuntimeSession::RuntimeSession(std::vector<ScenarioSwarm>& scenario, const QRectF& canvas, std::uint64_t seed, ScenarioSettings settings)
+    : settings_(settings), simulation_(false, seed)
 {
     std::vector<simulator::Swarm> swarms;
     std::vector<simulator::Peer> peers;
@@ -141,7 +142,7 @@ RuntimeSession::RuntimeSession(std::vector<ScenarioSwarm>& scenario, const QRect
         }
     }
     network_ = std::make_unique<simulator::Network>(simulation_, std::move(peers),
-        std::vector<simulator::Link>{}, std::move(swarms));
+        std::vector<simulator::Link>{}, std::move(swarms), 50, 1800, settings_.bitTorrent);
     // Immutable normalized geometry: 1..50 ms over the canvas diagonal.
     // Default link capacity is 100 MiB/s, converted to engine bits/s.
     // Tracker position and future GUI resizes cannot affect this provider.

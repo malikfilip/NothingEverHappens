@@ -31,6 +31,7 @@ void pacingCalculations() {
         PlaybackClock clock;
         clock.setSpeed(speed, 0, 0);
         clock.resume(0);
+        check(clock.position(0.25) == speed * 0.25);
         // An exact half real second at each speed, independent of engine time.
         check(clock.delayMilliseconds(speed * 0.5, 0, 0) == 500);
         check(clock.delayMilliseconds(speed * 0.5, 0, 0.25) == 250);
@@ -59,6 +60,54 @@ void pacingCalculations() {
     clock.pause(202.25);
     clock.resume(300);
     check(clock.delayMilliseconds(50.5, 50, 300) == 250);
+}
+void continuousPlaybackAndSingleStep() {
+    simulator::Simulation simulation;
+    RuntimePump pump;
+    int observations = 0, refreshes = 0, executed = 0;
+    simulation.setEventObserver([&](const simulator::Event&) { ++observations; });
+    for (double time : {100.0, 100.0, 200.0})
+        simulation.schedule(std::make_unique<Action>(time, [&] { ++executed; }));
+    QElapsedTimer wall;
+    wall.start();
+    std::vector<std::pair<double, double>> samples;
+    pump.playbackChanged = [&] {
+        ++refreshes;
+        samples.emplace_back(double(wall.nsecsElapsed()) / 1e9, pump.playbackTime());
+    };
+    pump.start(simulation);
+    QEventLoop loop;
+    QTimer::singleShot(80, &loop, &QEventLoop::quit);
+    loop.exec();
+    pump.pause();
+    const double frozen = pump.playbackTime();
+    check(frozen > 0 && frozen < 100 && refreshes >= 2);
+    check(samples.back().second > samples.front().second);
+    for (const auto& [elapsed, displayed] : samples)
+        check(std::abs(displayed - elapsed) < 0.03);
+    check(simulation.currentTime() == 0 && observations == 0);
+    settle();
+    check(pump.playbackTime() == frozen);
+    pump.setPlaybackSpeed(2);
+    pump.resume();
+    settle();
+    pump.pause();
+    check(pump.playbackTime() > frozen && simulation.currentTime() == 0);
+    pump.nextEvent();
+    check(executed == 1 && observations == 1 && pump.playbackTime() == 100);
+    check(pump.state() == RuntimePump::State::Paused);
+    settle();
+    check(executed == 1 && pump.playbackTime() == 100);
+    pump.nextEvent();
+    check(executed == 2 && observations == 2 && simulation.currentTime() == 100);
+    pump.resume();
+    settle();
+    pump.pause();
+    check(pump.playbackTime() > 100 && pump.playbackTime() < 200 && executed == 2);
+    pump.nextEvent();
+    check(executed == 3 && pump.playbackTime() == 200);
+    pump.nextEvent();
+    check(executed == 3 && observations == 3 && pump.state() == RuntimePump::State::Paused);
 }
 void delayedPump() {
     simulator::Simulation simulation;
@@ -242,6 +291,7 @@ int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     try {
         pacingCalculations();
+        continuousPlaybackAndSingleStep();
         delayedPump();
         completionAppearanceState();
         recurringPauseResume();

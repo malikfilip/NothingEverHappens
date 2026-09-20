@@ -1426,8 +1426,8 @@ void automaticBitfieldExchange()
     f.simulation.run();
     f.checkExchange(1);
     // BITFIELDs arrive at 2.488 and 2.588; interest announcements finish at 2.768.
-    // First periodic rechoke at t=10, then UNCHOKE transmission and propagation.
-    check(std::abs(f.simulation.currentTime() - 10.18) < 1e-12);
+    // Bootstrap UNCHOKE follows the initial interest through normal transport.
+    check(f.simulation.currentTime() < 3);
 
     const auto aBefore = f.network.peer(1).swarmState(1);
     const auto bBefore = f.network.peer(2).swarmState(1);
@@ -1483,8 +1483,8 @@ void simultaneousHandshakeBitfields()
     f.initiate(f.swarm, 2, 1);
     f.simulation.run();
     f.checkExchange(1);
-    // First periodic rechoke at t=10, then UNCHOKE transmission and propagation.
-    check(std::abs(f.simulation.currentTime() - 10.18) < 1e-12);
+    // Bootstrap UNCHOKE follows the initial interest through normal transport.
+    check(f.simulation.currentTime() < 3);
 }
 enum class ExecutedKind { Request, Start, Complete, Arrival };
 struct ExecutedMessage {
@@ -1787,8 +1787,8 @@ void chokePolicyAndArrival()
     f.simulation.run(); check(f.events.empty());
     f.receive(Message(MessageType::Interested));
     f.receive(Message(MessageType::Interested));
-    check(f.local().weAreChokingRemote);
-    f.simulation.schedule(std::make_unique<CheckEvent>(10.081, [&] {
+    check(!f.local().weAreChokingRemote);
+    f.simulation.schedule(std::make_unique<CheckEvent>(0.081, [&] {
         check(!f.local().weAreChokingRemote);
         check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
     }));
@@ -1798,15 +1798,15 @@ void chokePolicyAndArrival()
     f.simulation.schedule(std::make_unique<CheckEvent>(12, [&] {
         f.receive(Message(MessageType::NotInterested));
         f.receive(Message(MessageType::NotInterested));
-        check(!f.local().weAreChokingRemote); // Choke waits for t=20.
+        check(f.local().weAreChokingRemote); // Reactively releases the vacant assignment.
     }));
-    f.simulation.schedule(std::make_unique<CheckEvent>(20.081, [&] {
+    f.simulation.schedule(std::make_unique<CheckEvent>(12.081, [&] {
         check(f.local().weAreChokingRemote);
         check(!f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
     }));
     f.simulation.run();
-    checkEventTimes(f.events, 2, MessageType::Unchoke, 10, 10, 10.08, 10.18);
-    checkEventTimes(f.events, 2, MessageType::Choke, 20, 20, 20.08, 20.18);
+    checkEventTimes(f.events, 2, MessageType::Unchoke, 0, 0, 0.08, 0.18);
+    checkEventTimes(f.events, 2, MessageType::Choke, 12, 12, 12.08, 12.18);
     check(f.requests(MessageType::Choke) == 1 && f.requests(MessageType::Unchoke) == 1);
     check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
 }
@@ -1837,19 +1837,20 @@ void chokePolicyScope()
 void chokePolicyUsesFifo()
 {
     InterestFixture f;
+    occupyDirection(f.network, 1, 2, 1);
     f.receive(Message(MessageType::Interested));
-    f.simulation.schedule(std::make_unique<CheckEvent>(9, [&] { occupyDirection(f.network, 1, 2, 1); }));
-    f.simulation.schedule(std::make_unique<CheckEvent>(10.001, [&] {
+    f.simulation.schedule(std::make_unique<CheckEvent>(0.001, [&] {
         check(f.network.transmissionState(2, 1).pendingCount > 0);
         check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
     }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(11, [&] { occupyDirection(f.network, 1, 2, 1); }));
     f.simulation.schedule(std::make_unique<CheckEvent>(12, [&] { f.receive(Message(MessageType::NotInterested)); }));
-    f.simulation.schedule(std::make_unique<CheckEvent>(19, [&] { occupyDirection(f.network, 1, 2, 1); }));
     f.simulation.run();
-    checkEventTimes(f.events, 2, MessageType::Unchoke, 10, 11.176, 11.256, 11.356);
-    checkEventTimes(f.events, 2, MessageType::Choke, 20, 21.176, 21.256, 21.356);
+    checkEventTimes(f.events, 2, MessageType::Unchoke, 0, 2.176, 2.256, 2.356);
+    checkEventTimes(f.events, 2, MessageType::Choke, 12, 13.176, 13.256, 13.356);
     check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
-}struct RequestFixture {
+}
+struct RequestFixture {
     Swarm swarm{1, InfoHash{0x51}, 2500, 1024};
     Swarm other{2, InfoHash{0x52}, 1500, 1024};
     Peer a{1, 1000, 1000, PeerProtocolId{0xa1}};
@@ -2035,20 +2036,33 @@ void requestFifoArrival()
 
 void requestArrivalRevalidation()
 {
-    RequestFixture f;
-    const double start = f.simulation.currentTime();
-    f.network.send(1, 2, 1, Message(MessageType::Request, RequestPayload{0, 0, 16}));
-    // The receiver chokes the requester after enqueue but before arrival.
-    f.network.deliver(1, 2, 1, Message(MessageType::NotInterested));
-    PeerSwarmState beforeA, beforeB;
-    f.simulation.schedule(std::make_unique<CheckEvent>(start + .371, [&] {
-        beforeA = f.network.peer(1).swarmState(1);
-        beforeB = f.network.peer(2).swarmState(1);
-    }));
-    rejects([&] { f.simulation.run(); });
-    check(f.incoming().acceptedRequests.empty());
-    checkUnchanged(f.network.peer(1).swarmState(1), beforeA);
-    checkUnchanged(f.network.peer(2).swarmState(1), beforeB);
+    {
+        RequestFixture f;
+        f.network.send(1, 2, 1, Message(MessageType::Request, RequestPayload{0, 0, 16}));
+        // A managed reactive CHOKE crossing REQUEST releases the obsolete request.
+        f.network.deliver(1, 2, 1, Message(MessageType::NotInterested));
+        check(f.incoming().weAreChokingRemote);
+        f.simulation.run();
+        check(f.incoming().acceptedRequests.empty() && f.outgoing().outgoingRequests.empty());
+        check(f.network.peer(2).swarmState(1).receivedBlocks.empty());
+    }
+    {
+        RequestFixture f;
+        const double start = f.simulation.currentTime();
+        f.network.send(1, 2, 1, Message(MessageType::Request, RequestPayload{0, 0, 16}));
+        // Invalid requests outside managed policy still undergo strict arrival validation.
+        auto& incoming = const_cast<PeerConnectionState&>(f.incoming());
+        incoming.remoteInterestedInUs = false;
+        PeerSwarmState beforeA, beforeB;
+        f.simulation.schedule(std::make_unique<CheckEvent>(start + .371, [&] {
+            beforeA = f.network.peer(1).swarmState(1);
+            beforeB = f.network.peer(2).swarmState(1);
+        }));
+        rejects([&] { f.simulation.run(); });
+        check(f.incoming().acceptedRequests.empty());
+        checkUnchanged(f.network.peer(1).swarmState(1), beforeA);
+        checkUnchanged(f.network.peer(2).swarmState(1), beforeB);
+    }
 }
 void piecePayloadTimingAndFifo()
 {

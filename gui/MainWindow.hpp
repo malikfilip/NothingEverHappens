@@ -2,9 +2,12 @@
 
 #include <QMainWindow>
 #include "ScenarioSwarm.hpp"
+#include "ScenarioSettings.hpp"
 #include "RuntimePump.hpp"
+#include "simulator/PeerCompletedEvent.hpp"
 #include <vector>
 #include <memory>
+#include <deque>
 
 class QStackedWidget;
 class QComboBox;
@@ -24,8 +27,12 @@ public:
 
 private:
     void createToolbar();
+    void showSettings();
     void play();
     void updateRuntimeControls();
+    void queueCompletion(simulator::PeerId peer, simulator::SwarmId swarm);
+    void presentCompletions();
+    void showNextCompletion();
     void addSwarm();
     void addPeer();
     ScenarioSwarm* findSwarm(quint64 id);
@@ -37,9 +44,15 @@ private:
     QWidget* createMessageFilter();
 
     std::vector<ScenarioSwarm> swarms_;
+    ScenarioSettings settings_;
+    std::deque<QString> completionMessages_;
+    bool presentingCompletions_ = false;
+    bool resumeAfterCompletions_ = false;
+    QAction* settingsAction_ = nullptr;
     std::unique_ptr<RuntimeSession> runtime_;
     RuntimePump pump_; // Destroyed before the session.
     QAction* pauseAction_ = nullptr;
+    QAction* nextEventAction_ = nullptr;
     QLabel* simulationTime_ = nullptr;
     QTableView* eventLog_ = nullptr;
     QStandardItemModel* eventLogModel_ = nullptr;

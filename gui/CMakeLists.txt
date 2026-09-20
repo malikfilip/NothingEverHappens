@@ -12,6 +12,8 @@ qt_add_executable(picoTorrent_gui
     ScenarioSwarm.hpp
     resources.qrc
     PieceBitmapDialog.hpp PieceBitmapDialog.cpp
+    ScenarioSettings.hpp
+    SimulationSettingsDialog.hpp SimulationSettingsDialog.cpp
     MainWindow.hpp
     MainWindow.cpp
     SimulationView.hpp

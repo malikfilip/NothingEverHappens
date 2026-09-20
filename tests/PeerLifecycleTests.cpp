@@ -684,7 +684,7 @@ void optimisticLeave() {
         departed = *optimistic;
         PeerLeaveEvent leave(sim.currentTime(), net, 1, departed); sim.executeNow(leave);
         const auto& state = net.peer(1).swarmState(1);
-        check(!state.choking.optimistic && state.choking.optimisticCursor != departed, "Dangling optimistic reference");
+        check(state.choking.optimistic != departed && state.choking.optimisticCursor != departed, "Dangling optimistic reference");
     });
     at(sim, 20.5, [&] {
         const auto& state = net.peer(1).swarmState(1);

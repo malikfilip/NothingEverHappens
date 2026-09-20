@@ -34,10 +34,10 @@ public:
         if (!std::isfinite(remaining) || remaining >= 1) return 1000;
         return static_cast<int>(std::ceil(remaining * 1000));
     }
-private:
     double position(double now) const {
         return position_ + (running_ ? std::max(0.0, now - wallAnchor_) * speed_ : 0.0);
     }
+private:
     double speed_ = 1;
     double position_ = 0;
     double wallAnchor_ = 0;

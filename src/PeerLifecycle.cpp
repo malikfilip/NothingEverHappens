@@ -149,6 +149,7 @@ void Network::leaveSwarm(SwarmId swarmId, PeerId local) {
             found->second.pending.erase(local);
             found->second.initiatedNeighbors.erase(local);
         }
+        other.choking.preferred.erase(local);
         if (other.choking.optimistic == local) other.choking.optimistic.reset();
         if (other.choking.optimisticCursor == local) other.choking.optimisticCursor.reset();
     }
@@ -161,7 +162,7 @@ void Network::leaveSwarm(SwarmId swarmId, PeerId local) {
         std::set<PeerId> remotes;
         for (const auto& [remote, connection] : p.swarmState(swarmId).connections) remotes.insert(remote);
         for (const auto remote : remotes) tryScheduleRequests(p, swarmId, remote);
-        if (!remotes.empty() && p.swarmState(swarmId).choking.managed) scheduleRechoke(survivor, swarmId);
+        if (p.swarmState(swarmId).choking.managed) updateChoking(survivor, swarmId);
     }
 }
 }

@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <vector>
 #include <optional>
+#include <set>
 
 #include "simulator/SwarmId.hpp"
 #include "simulator/Message.hpp"
@@ -37,7 +38,7 @@ namespace simulator {
         // Accepted responses already handed to Network (including FIFO/propagation).
         std::vector<RequestPayload> committedRequests;
 
-        // Current and previous globally aligned 10-second buckets.
+        // Current and previous peer/swarm-local regular-interval buckets.
         std::uint64_t downloadedInWindow = 0;
         std::uint64_t uploadedInWindow = 0;
         std::uint64_t downloadedPreviousInterval = 0;
@@ -57,8 +58,15 @@ namespace simulator {
     struct ChokingState {
         bool eventPending = false;
         bool managed = false;
-        double windowStart = 0; // Start of the current byte bucket.
-        double nextOptimisticRotation = 30;
+        bool cycleActive = false;
+        std::uint64_t cycleGeneration = 0;
+        double cycleStart = 0;
+        double windowStart = 0;
+        bool previousIntervalMeasured = false;
+        double nextRegularDeadline = 0;
+        double nextOptimisticDeadline = 0;
+        std::optional<double> pendingWakeup;
+        std::set<PeerId> preferred;
         std::optional<PeerId> optimistic;
         std::optional<PeerId> optimisticCursor;
     };

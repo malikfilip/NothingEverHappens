@@ -20,7 +20,7 @@ Bandwidth inputs use whole KiB/s, MiB/s, or GiB/s with exact byte/s storage.
 Play validates all swarms and creates one engine runtime session, with real initial
 joins queued at t=0. A Qt timer executes one engine step per callback. Pause and
 Resume preserve the session; editing remains locked in both runtime states. The
-Event Log shows the newest 2,000 real event notifications. Stop and Next remain
+Event Log shows the newest 2,000 real event notifications. Next Event steps once while paused. Stop remains
 unimplemented. See [RUNTIME.md](RUNTIME.md) for bridge ownership,
 identity, piece generation, link defaults and limitations.
 

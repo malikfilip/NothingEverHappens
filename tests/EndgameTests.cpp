@@ -1,3 +1,4 @@
+#include "simulator/PeerCompletedEvent.hpp"
 #include "EndgameAssertions.hpp"
 #include <algorithm>
 #include <functional>
@@ -112,10 +113,21 @@ void firstWins(bool requestStillInFlight, bool queued, unsigned blockSize = 1638
         for (int i = 0; i < 2000; ++i)
             f.net.send(1, 3, 2, Message(MessageType::Cancel, CancelPayload{0, 0, 1}));
     }
-    unsigned cancels = 0, pieces = 0, haves = 0;
+    unsigned cancels = 0, pieces = 0, haves = 0, completions = 0;
+    double lastPieceTime = -1;
     bool sawRetired = false, checkedLate = false, checkedRequestBeforeCancel = false;
     std::set<PeerId> providers;
     f.sim.setEventObserver([&](const Event& event) {
+        if (const auto* arrival = dynamic_cast<const MessageArrivalEvent*>(&event);
+            arrival && arrival->details().messageType == MessageType::Piece)
+            lastPieceTime = event.time();
+        if (const auto* completed = dynamic_cast<const PeerCompletedEvent*>(&event)) {
+            ++completions;
+            check(completed->peerId() == 2 && completed->swarmId() == 1);
+            check(event.time() == lastPieceTime && event.time() == f.sim.currentTime());
+            check(f.state().localBitfield[0] == 0x80);
+            check(event.traceDescription() == "PEER_COMPLETED Peer 2 Swarm 1");
+        }
         if (const auto* start = dynamic_cast<const TransmissionStartEvent*>(&event)) {
             const auto d = start->details();
             if (d.messageType == MessageType::Request) check(providers.insert(d.receiver).second);
@@ -158,9 +170,11 @@ void firstWins(bool requestStillInFlight, bool queued, unsigned blockSize = 1638
     check(f.download(1).scheduledRequests == std::vector<RequestPayload>{block});
     check(f.download(3).scheduledRequests == std::vector<RequestPayload>{block});
     f.sim.run();
-    check(cancels == 1 && haves == 2 && providers.size() == 2);
-    check(pieces == 2);
-    check(checkedLate && checkedRequestBeforeCancel);
+    check(cancels == 1 && haves == 2 && providers.size() == 2 && completions == 1);
+    // Reactive NOT_INTERESTED handling may purge a still-queued losing PIECE.
+    // Active/propagating losers must retain the original late-arrival semantics.
+    check(pieces == (queued ? 1u : 2u));
+    check(checkedLate == !queued && checkedRequestBeforeCancel);
     check(f.state().receivedBlocks.at(0) == std::vector<BlockRange>{{0, blockSize}});
     f.drained();
     rejects([&] { f.net.deliver(1, 3, 2, Message(MessageType::Piece, PiecePayload{0, 0, blockSize})); });

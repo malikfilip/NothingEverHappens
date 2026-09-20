@@ -9,6 +9,7 @@
 #include <utility>
 #include <tuple>
 
+#include "simulator/PeerCompletedEvent.hpp"
 #include "simulator/MessageArrivalEvent.hpp"
 #include "simulator/SendMessageEvent.hpp"
 #include "simulator/Simulation.hpp"
@@ -21,9 +22,10 @@ namespace simulator {
         constexpr std::size_t requestPipelineDepth = 5;
     }
 
-    Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms, std::size_t trackerMaximum, double trackerInterval)
-        : tracker_(trackerMaximum, simulation.seed(), trackerInterval), simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
+    Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms, std::size_t trackerMaximum, double trackerInterval, BitTorrentSettings settings)
+        : bitTorrentSettings_(settings), tracker_(trackerMaximum, simulation.seed(), trackerInterval), simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
     {
+        if (const auto* error = settings.validationError()) throw std::invalid_argument(error);
         for (std::size_t i = 0; i < peers_.size(); ++i) {
             peer_transport_.try_emplace(peers_[i].id(), PeerTransport{i, {}, {}});
         }
@@ -174,6 +176,10 @@ namespace simulator {
             const auto& state = to->swarmState(swarmId);
             if (!pieceWasOwned && (state.localBitfield[piece.index / 8]
                 & (0x80u >> (piece.index % 8))) != 0) {
+                if (ownsAll(currentSwarm, state)) {
+                    PeerCompletedEvent completed(simulation_.currentTime(), receiver, swarmId);
+                    simulation_.executeNow(completed);
+                }
                 // Stable broadcast order; unordered connection storage must not affect tracing.
                 std::vector<PeerId> recipients;
                 for (const auto& [remote, connection] : state.connections) {
@@ -195,14 +201,13 @@ namespace simulator {
                 }
             }
         }
-        if (interestMessage) {
-            enforceInterestedLimit(receiver, swarmId);
-            if (message.type() == MessageType::Interested
-                || !to->swarmState(swarmId).connections.at(sender).weAreChokingRemote) {
-                scheduleRechoke(receiver, swarmId);
-            }
+        if (interestMessage) updateChoking(receiver, swarmId);
+        if (availability && to->swarmState(swarmId).choking.managed) updateChoking(receiver, swarmId);
+        if (message.type() == MessageType::Piece) {
+            // Completion can suspend an upload cycle or make a managed peer useful.
+            for (const auto local : {sender, receiver})
+                if (peer(local).swarmState(swarmId).choking.managed) updateChoking(local, swarmId);
         }
-        if (availability && to->swarmState(swarmId).choking.managed && hasUsefulExchange(receiver, swarmId)) scheduleRechoke(receiver, swarmId);
         if (availability) {
             const bool interested = to->swarmState(swarmId).connections.at(sender).weAreInterestedInRemote;
             if (interested != wasInterested) {
