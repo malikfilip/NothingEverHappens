@@ -54,8 +54,8 @@ struct Fixture {
         }
         return result;
     }
-    explicit Fixture(unsigned size = 16384, double slowRate = 1e5, double slowLatency = .01)
-        : swarm(1, InfoHash{1}, size, size),
+    explicit Fixture(unsigned size = 16384, double slowRate = 1e5, double slowLatency = .01, unsigned blockSize = 16384)
+        : swarm(1, InfoHash{1}, size, size, blockSize),
           net(sim, peers(), {Link(1, 2, 1e6, .01), Link(2, 3, slowRate, slowLatency)}, {swarm}) {}
     PeerSwarmState& state(PeerId id = 2) {
         return const_cast<PeerSwarmState&>(net.peer(id).swarmState(1));
@@ -73,8 +73,8 @@ struct Fixture {
         }
     }
 };
-void normalAndCapacity() {
-    Fixture f(12 * 16384);
+void normalAndCapacity(unsigned blockSize = 16384) {
+    Fixture f(12 * blockSize, 1e5, .01, blockSize);
     f.start();
     f.net.deliver(1, 3, 2, Message(MessageType::Unchoke));
     check(f.download(1).scheduledRequests.size() == 5);
@@ -104,9 +104,9 @@ void normalAndCapacity() {
     check(duplicates > 0 && f.state().localBitfield[0] == 0x80);
     f.drained();
 }
-void firstWins(bool requestStillInFlight, bool queued) {
-    Fixture f(16384, queued ? 1e6 : 1e5, requestStillInFlight ? 1 : .01);
-    const RequestPayload block{0, 0, 16384};
+void firstWins(bool requestStillInFlight, bool queued, unsigned blockSize = 16384) {
+    Fixture f(blockSize, queued ? 1e6 : 1e5, requestStillInFlight ? 1 : .01, blockSize);
+    const RequestPayload block{0, 0, blockSize};
     if (queued) {
         // Valid control traffic occupies the losing upload direction until after CANCEL.
         for (int i = 0; i < 2000; ++i)
@@ -161,9 +161,9 @@ void firstWins(bool requestStillInFlight, bool queued) {
     check(cancels == 1 && haves == 2 && providers.size() == 2);
     check(pieces == 2);
     check(checkedLate && checkedRequestBeforeCancel);
-    check(f.state().receivedBlocks.at(0) == std::vector<BlockRange>{{0, 16384}});
+    check(f.state().receivedBlocks.at(0) == std::vector<BlockRange>{{0, blockSize}});
     f.drained();
-    rejects([&] { f.net.deliver(1, 3, 2, Message(MessageType::Piece, PiecePayload{0, 0, 16384})); });
+    rejects([&] { f.net.deliver(1, 3, 2, Message(MessageType::Piece, PiecePayload{0, 0, blockSize})); });
 }
 void earlyCancel() {
     Fixture f;
@@ -290,9 +290,13 @@ void leaveWithRetired() {
 int main() {
     try {
         normalAndCapacity();
+        normalAndCapacity(4096);
+        normalAndCapacity(32768);
         firstWins(false, false);
         firstWins(false, true);
         firstWins(true, false);
+        firstWins(false, false, 4096);
+        firstWins(true, false, 32768);
         earlyCancel();
         manualCancel(false);
         manualCancel(true);

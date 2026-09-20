@@ -1,5 +1,6 @@
 #include "SimulationView.hpp"
 #include "ScenarioSwarm.hpp"
+#include "PeerInspection.hpp"
 
 #include <QApplication>
 #include <QContextMenuEvent>
@@ -38,7 +39,7 @@ QPointF clampedNodePosition(const QGraphicsItem& node, const QPointF& position,
 class PeerNode : public QGraphicsItemGroup {
 public:
     PeerNode(const ScenarioPeer& peer, const QGraphicsView& view)
-        : id(peer.id), view_(view), role_(peer.initialRole), initiallyJoined_(peer.initiallyJoined)
+        : id(peer.id), view_(view), initiallyJoined_(peer.initiallyJoined)
     {
         circle_ = new QGraphicsEllipseItem(QRectF(-16, -16, 32, 32));
         applyColors();
@@ -64,6 +65,16 @@ public:
     void setInitiallyJoined(bool joined)
     {
         initiallyJoined_ = joined;
+        setVisualState(joined, complete_);
+    }
+    void setVisualState(bool joined, bool complete) {
+        if (joined_ == joined && complete_ == complete) return;
+        joined_ = joined;
+        complete_ = complete;
+        applyColors(); // QGraphicsEllipseItem brush/pen changes schedule its repaint.
+    }
+    void setHighlighted(bool selected) {
+        selected_ = selected;
         applyColors();
     }
     quint64 id;
@@ -80,17 +91,19 @@ protected:
 private:
     void applyColors()
     {
-        const QColor outline = !initiallyJoined_ ? QColor("#a52d32")
-            : role_ == ScenarioPeer::Role::Seeder ? QColor("#267343") : QColor("#9b7b16");
-        const QColor fill = !initiallyJoined_ ? QColor("#dc4c52")
-            : role_ == ScenarioPeer::Role::Seeder ? QColor("#49b76b") : QColor("#f0ce4e");
-        circle_->setPen(QPen(outline, 1.5));
+        const QColor outline = !joined_ ? QColor("#a52d32")
+            : complete_ ? QColor("#267343") : QColor("#9b7b16");
+        const QColor fill = !joined_ ? QColor("#dc4c52")
+            : complete_ ? QColor("#49b76b") : QColor("#f0ce4e");
+        circle_->setPen(QPen(selected_ ? QColor("#287bff") : outline, selected_ ? 4.0 : 1.5));
         circle_->setBrush(fill);
     }
     const QGraphicsView& view_;
     QGraphicsEllipseItem* circle_;
-    ScenarioPeer::Role role_;
     bool initiallyJoined_;
+    bool joined_ = false;
+    bool complete_ = false;
+    bool selected_ = false;
 };
 
 class TrackerNode : public QGraphicsPixmapItem {
@@ -137,6 +150,7 @@ void SimulationView::resizeEvent(QResizeEvent* event)
 {
     QGraphicsView::resizeEvent(event);
     updateCanvasRect();
+    if (!editingEnabled_) return;
     // Shrinking the viewport may bring an edge across an existing node.
     // Movement callbacks persist the corrected position, including during placement.
     for (auto* item : scene()->items()) {
@@ -159,17 +173,20 @@ PeerNode* SimulationView::addPeerNode(const ScenarioPeer& peer)
     auto* node = new PeerNode(peer, *this);
     scene()->addItem(node);
     node->moved = [this, swarmId = swarmId_, id = peer.id](QPointF position) {
-        if ((!pendingPeer_ || pendingPeer_->id != id) && peerMoved)
+        if (editingEnabled_ && (!pendingPeer_ || pendingPeer_->id != id) && peerMoved)
             peerMoved(swarmId, id, position);
     };
     node->setPos(clampedNodePosition(*node, peer.position, *this));
     node->moved(node->pos());
+    node->setFlag(QGraphicsItem::ItemIsMovable, editingEnabled_);
+    if (!editingEnabled_) node->unsetCursor();
     return node;
 }
 
 void SimulationView::showSwarm(const ScenarioSwarm* swarm)
 {
     cancelPeerPlacement();
+    selectPeer(std::nullopt);
     scene()->clear();
     swarmId_ = swarm ? swarm->id : 0;
     if (swarm) {
@@ -181,10 +198,12 @@ void SimulationView::showSwarm(const ScenarioSwarm* swarm)
 
         tracker->setToolTip(tr("Tracker - %1").arg(swarm->name));
         tracker->moved = [this, swarmId = swarm->id](QPointF position) {
-            if (trackerMoved) trackerMoved(swarmId, position);
+            if (editingEnabled_ && trackerMoved) trackerMoved(swarmId, position);
         };
         tracker->setPos(clampedNodePosition(*tracker, swarm->trackerPosition, *this));
         tracker->moved(tracker->pos());
+        tracker->setFlag(QGraphicsItem::ItemIsMovable, editingEnabled_);
+        if (!editingEnabled_) tracker->unsetCursor();
         for (const auto& peer : swarm->peers) addPeerNode(peer);
     }
 
@@ -192,7 +211,7 @@ void SimulationView::showSwarm(const ScenarioSwarm* swarm)
 
 void SimulationView::beginPeerPlacement(const ScenarioPeer& peer)
 {
-    if (!swarmId_ || pendingPeer_) return;
+    if (!editingEnabled_ || !swarmId_ || pendingPeer_) return;
     pendingPeer_ = peer;
     preview_ = addPeerNode(peer);
     preview_->setFlag(QGraphicsItem::ItemIsMovable, false);
@@ -257,6 +276,12 @@ void SimulationView::mousePressEvent(QMouseEvent* event)
         event->accept();
         return;
     }
+    if (event->button() == Qt::LeftButton) {
+        auto* item = itemAt(event->position().toPoint());
+        while (item && item->parentItem()) item = item->parentItem();
+        auto* peer = dynamic_cast<PeerNode*>(item);
+        selectPeer(peer ? std::optional<quint64>(peer->id) : std::nullopt);
+    }
     QGraphicsView::mousePressEvent(event);
 }
 
@@ -272,6 +297,7 @@ void SimulationView::keyPressEvent(QKeyEvent* event)
 
 void SimulationView::contextMenuEvent(QContextMenuEvent* event)
 {
+    if (!editingEnabled_) { event->accept(); return; }
     if (suppressContextMenu_) {
         suppressContextMenu_ = false;
         event->accept();
@@ -295,6 +321,7 @@ void SimulationView::contextMenuEvent(QContextMenuEvent* event)
         if (peerInitiallyJoinedChanged) peerInitiallyJoinedChanged(swarmId_, node->id, joined);
         node->setInitiallyJoined(joined);
     } else if (selected == remove) {
+        if (selectedPeer_ == node->id) selectPeer(std::nullopt);
         if (peerRemoved) peerRemoved(swarmId_, node->id);
         delete node;
     }
@@ -309,4 +336,37 @@ bool SimulationView::viewportEvent(QEvent* event)
             updatePreview(viewport()->mapFromGlobal(QCursor::pos()));
     }
     return QGraphicsView::viewportEvent(event);
+}
+
+void SimulationView::setEditingEnabled(bool enabled)
+{
+    if (!enabled) cancelPeerPlacement();
+    editingEnabled_ = enabled;
+    setInteractive(enabled);
+    for (auto* item : scene()->items()) {
+        if (!item->parentItem()) {
+            item->setFlag(QGraphicsItem::ItemIsMovable, enabled);
+            if (enabled) item->setCursor(Qt::OpenHandCursor);
+            else item->unsetCursor();
+        }
+    }
+}
+
+void SimulationView::selectPeer(std::optional<quint64> id)
+{
+    if (selectedPeer_ == id) return;
+    selectedPeer_ = id;
+    for (auto* item : scene()->items())
+        if (auto* peer = dynamic_cast<PeerNode*>(item)) peer->setHighlighted(id == peer->id);
+    if (selectionChanged) selectionChanged();
+}
+
+void SimulationView::refreshPeerColors(const std::function<PeerInspection(quint64)>& inspect)
+{
+    for (auto* item : scene()->items()) {
+        auto* node = dynamic_cast<PeerNode*>(item);
+        if (!node || node == preview_) continue;
+        const auto state = inspect(node->id);
+        node->setVisualState(state.joined, state.complete());
+    }
 }

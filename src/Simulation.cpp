@@ -79,6 +79,12 @@ namespace simulator {
         event.execute();
     }
 
+    std::optional<double> Simulation::nextEventTime() const
+    {
+        if (event_queue_.empty()) return std::nullopt;
+        return event_queue_.front()->time();
+    }
+
     double Simulation::currentTime() const
     {
         return current_time_;

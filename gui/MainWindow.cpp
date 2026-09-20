@@ -3,9 +3,14 @@
 #include "AddSwarmDialog.hpp"
 #include "AddPeerDialog.hpp"
 #include "SimulationView.hpp"
+#include "RuntimeSession.hpp"
+#include "ScenarioPieces.hpp"
+#include "PeerInspection.hpp"
+#include "PieceBitmapDialog.hpp"
 
 #include <array>
 #include <algorithm>
+#include <cmath>
 
 #include <QAction>
 #include <QCheckBox>
@@ -19,6 +24,7 @@
 #include <QLocale>
 #include <QHeaderView>
 #include <QLabel>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSplitter>
@@ -30,6 +36,20 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+namespace {
+QString simulationTimeText(double time)
+{
+    // Unbounded total minutes; seconds/milliseconds conversions stay bounded.
+    if (!std::isfinite(time) || time < 0) return QStringLiteral("Sim Time: %1 s").arg(time);
+    const double minutes = std::floor(time / 60);
+    const int milliseconds = static_cast<int>(std::floor(std::fmod(time, 60.0) * 1000));
+    return QStringLiteral("Sim Time: %1:%2.%3")
+        .arg(QString::number(minutes, 'f', 0).rightJustified(2, QLatin1Char('0')))
+        .arg(milliseconds / 1000, 2, 10, QLatin1Char('0'))
+        .arg(milliseconds % 1000, 3, 10, QLatin1Char('0'));
+}
+}
+
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
@@ -37,16 +57,30 @@ MainWindow::MainWindow(QWidget* parent)
     resize(1280, 820);
     setMinimumSize(640, 480);
     createToolbar();
+    pump_.stateChanged = [this] { updateRuntimeControls(); };
+    pump_.stepped = [this] {
+        simulationTime_->setText(simulationTimeText(runtime_->simulation().currentTime()));
+        eventLog_->scrollToBottom();
+        refreshInspector();
+    };
+    pump_.failed = [this](const char* message) {
+        simulationTime_->setText(simulationTimeText(runtime_->simulation().currentTime()));
+        eventLog_->scrollToBottom();
+        refreshInspector();
+        QMessageBox::critical(this, tr("Simulation paused after an error"), QString::fromUtf8(message));
+    };
 
     auto* canvasPanel = new QGroupBox(tr("Simulation Canvas"));
     auto* canvasLayout = new QVBoxLayout(canvasPanel);
     canvas_ = new SimulationView(canvasPanel);
     canvasLayout->addWidget(canvas_);
+    canvas_->selectionChanged = [this] { refreshInspector(); };
     canvas_->peerPlaced = [this](quint64 swarmId, const ScenarioPeer& peer) {
         if (auto* swarm = findSwarm(swarmId)) {
             swarm->peers.push_back(peer);
             ++nextPeerId_;
         }
+        refreshInspector();
     };
     canvas_->peerMoved = [this](quint64 swarmId, quint64 peerId, QPointF position) {
         if (auto* swarm = findSwarm(swarmId)) {
@@ -63,47 +97,49 @@ MainWindow::MainWindow(QWidget* parent)
             for (auto& peer : swarm->peers)
                 if (peer.id == peerId) { peer.initiallyJoined = joined; break; }
         }
+        refreshInspector();
     };
     canvas_->trackerMoved = [this](quint64 swarmId, QPointF position) {
         if (auto* swarm = findSwarm(swarmId)) swarm->trackerPosition = position;
     };
     canvas_->placementChanged = [this] {
-        addPeerAction_->setEnabled(swarmSelector_->currentIndex() >= 0 && !canvas_->isPlacingPeer());
+        addPeerAction_->setEnabled(!runtime_ && swarmSelector_->currentIndex() >= 0 && !canvas_->isPlacingPeer());
+        updateRuntimeControls();
         canvas_->setToolTip(canvas_->isPlacingPeer()
             ? tr("Click to place the peer. Escape or right-click cancels placement.") : QString{});
     };
-
-    auto* left = new QSplitter(Qt::Vertical);
-    left->setObjectName("canvasLogSplitter");
-    left->setChildrenCollapsible(false);
-    left->addWidget(canvasPanel);
-    left->addWidget(createEventLog());
-    left->setStretchFactor(0, 3);
-    left->setStretchFactor(1, 1);
-    left->setSizes({540, 220});
 
     auto* right = new QSplitter(Qt::Vertical);
     right->setObjectName("inspectorFilterSplitter");
     right->setChildrenCollapsible(false);
     right->addWidget(createInspector());
     right->addWidget(createMessageFilter());
-    right->setStretchFactor(0, 3);
+    right->setStretchFactor(0, 2);
     right->setStretchFactor(1, 1);
-    right->setSizes({540, 220});
+    right->setSizes({360, 180});
 
-    auto* columns = new QSplitter(Qt::Horizontal);
-    columns->setObjectName("mainSplitter");
-    columns->setChildrenCollapsible(false);
-    columns->addWidget(left);
-    columns->addWidget(right);
-    columns->setStretchFactor(0, 4);
-    columns->setStretchFactor(1, 1);
-    columns->setSizes({960, 300});
+    auto* upper = new QSplitter(Qt::Horizontal);
+    upper->setObjectName("upperSplitter");
+    upper->setChildrenCollapsible(false);
+    upper->addWidget(canvasPanel);
+    upper->addWidget(right);
+    upper->setStretchFactor(0, 4);
+    upper->setStretchFactor(1, 1);
+    upper->setSizes({960, 300});
+
+    auto* main = new QSplitter(Qt::Vertical);
+    main->setObjectName("mainSplitter");
+    main->setChildrenCollapsible(false);
+    main->addWidget(upper);
+    main->addWidget(createEventLog());
+    main->setStretchFactor(0, 3);
+    main->setStretchFactor(1, 1);
+    main->setSizes({540, 220});
 
     auto* central = new QWidget(this);
     auto* layout = new QVBoxLayout(central);
     layout->setContentsMargins(8, 8, 8, 8);
-    layout->addWidget(columns);
+    layout->addWidget(main);
     setCentralWidget(central);
 }
 
@@ -118,18 +154,37 @@ void MainWindow::createToolbar()
         action->setEnabled(false);
         action->setToolTip(tr("Not connected yet."));
     };
-    connect(toolbar->addAction(tr("+ Swarm")), &QAction::triggered, this, &MainWindow::addSwarm);
+    addSwarmAction_ = toolbar->addAction(tr("+ Swarm"));
+    connect(addSwarmAction_, &QAction::triggered, this, &MainWindow::addSwarm);
     addPeerAction_ = toolbar->addAction(tr("+ Peer"));
     addPeerAction_->setEnabled(false);
     connect(addPeerAction_, &QAction::triggered, this, &MainWindow::addPeer);
     toolbar->addSeparator();
     disable(toolbar->addAction(style()->standardIcon(QStyle::SP_MediaStop), tr("Stop")));
-    disable(toolbar->addAction(style()->standardIcon(QStyle::SP_MediaPlay), tr("Play")));
-    disable(toolbar->addAction(style()->standardIcon(QStyle::SP_MediaPause), tr("Pause")));
+    playAction_ = toolbar->addAction(style()->standardIcon(QStyle::SP_MediaPlay), tr("Play"));
+    connect(playAction_, &QAction::triggered, this, &MainWindow::play);
+    pauseAction_ = toolbar->addAction(style()->standardIcon(QStyle::SP_MediaPause), tr("Pause"));
+    pauseAction_->setEnabled(false);
+    connect(pauseAction_, &QAction::triggered, this, [this] { pump_.pause(); });
     disable(toolbar->addAction(style()->standardIcon(QStyle::SP_MediaSkipForward), tr("Next Event")));
     toolbar->addSeparator();
 
-    auto* time = new QLabel(tr("Time: 0.000 s"), toolbar);
+    auto* speedLabel = new QLabel(tr("Speed:"), toolbar);
+    toolbar->addWidget(speedLabel);
+    auto* speed = new QComboBox(toolbar);
+    speed->setObjectName("playbackSpeed");
+    for (const double value : {0.5, 1.0, 2.0, 5.0, 10.0})
+        speed->addItem(QString::number(value) + QStringLiteral("x"), value);
+    speed->addItem(tr("Max"), 0.0);
+    speed->setCurrentIndex(1);
+    speedLabel->setBuddy(speed);
+    toolbar->addWidget(speed);
+    connect(speed, &QComboBox::currentIndexChanged, this, [this, speed] {
+        pump_.setPlaybackSpeed(speed->currentData().toDouble());
+    });
+
+    auto* time = new QLabel(simulationTimeText(0), toolbar);
+    simulationTime_ = time;
     time->setObjectName("simulationTime");
     time->setContentsMargins(6, 0, 6, 0);
     toolbar->addWidget(time);
@@ -151,8 +206,11 @@ void MainWindow::createToolbar()
     connect(swarmSelector_, &QComboBox::currentIndexChanged, this, [this](int index) {
         const bool active = index >= 0 && static_cast<std::size_t>(index) < swarms_.size();
         swarmInfo_->setEnabled(active);
-        addPeerAction_->setEnabled(active);
-        if (canvas_) canvas_->showSwarm(active ? &swarms_[index] : nullptr);
+        addPeerAction_->setEnabled(active && !runtime_);
+        if (canvas_) {
+            canvas_->showSwarm(active ? &swarms_[index] : nullptr);
+            refreshInspector();
+        }
     });
 }
 
@@ -165,11 +223,35 @@ QWidget* MainWindow::createInspector()
     inspectorContents_->setObjectName("inspectorContents");
     auto* placeholder = new QWidget(inspectorContents_);
     auto* placeholderLayout = new QVBoxLayout(placeholder);
-    auto* hint = new QLabel(tr("Select a peer, tracker, or connection to inspect its state."), placeholder);
+    auto* hint = new QLabel(tr("Left-click a peer to inspect its state."), placeholder);
     hint->setWordWrap(true);
     placeholderLayout->addWidget(hint);
     placeholderLayout->addStretch();
     inspectorContents_->addWidget(placeholder);
+    auto* details = new QWidget(inspectorContents_);
+    auto* detailsLayout = new QVBoxLayout(details);
+    auto* scroll = new QScrollArea(details);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    inspectorDetails_ = new QLabel(scroll);
+    inspectorDetails_->setObjectName("peerInspectorDetails");
+    inspectorDetails_->setTextFormat(Qt::PlainText);
+    inspectorDetails_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    inspectorDetails_->setWordWrap(true);
+    inspectorDetails_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    scroll->setWidget(inspectorDetails_);
+    detailsLayout->addWidget(scroll, 1);
+    viewPieces_ = new QPushButton(tr("View Pieces..."), details);
+    viewPieces_->setObjectName("viewPeerPieces");
+    detailsLayout->addWidget(viewPieces_);
+    inspectorContents_->addWidget(details);
+    piecesDialog_ = new PieceBitmapDialog(this);
+    connect(viewPieces_, &QPushButton::clicked, this, [this] {
+        piecesDialog_->show();
+        refreshInspector();
+        piecesDialog_->raise();
+        piecesDialog_->activateWindow();
+    });
     layout->addWidget(inspectorContents_);
     return panel;
 }
@@ -181,9 +263,10 @@ QWidget* MainWindow::createEventLog()
     auto* table = new QTableView(panel);
     table->setObjectName("eventLog");
     table->setMinimumHeight(100);
-    auto* model = new QStandardItemModel(0, 6, table);
-    model->setHorizontalHeaderLabels({tr("Time"), tr("Event"), tr("From"),
-        tr("To"), tr("Swarm"), tr("Details")});
+    eventLog_ = table;
+    auto* model = new QStandardItemModel(0, 2, table);
+    eventLogModel_ = model;
+    model->setHorizontalHeaderLabels({tr("Time (s)"), tr("Event")});
     table->setModel(model);
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -193,7 +276,7 @@ QWidget* MainWindow::createEventLog()
     table->horizontalHeader()->setMinimumSectionSize(55);
     table->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
     table->horizontalHeader()->setStretchLastSection(true);
-    const std::array<int, 6> widths{85, 150, 75, 75, 85, 250};
+    const std::array<int, 2> widths{125, 650};
     for (int column = 0; column < static_cast<int>(widths.size()); ++column)
         table->setColumnWidth(column, widths[column]);
     layout->addWidget(table);
@@ -264,6 +347,7 @@ QWidget* MainWindow::createMessageFilter()
 
 void MainWindow::addSwarm()
 {
+    if (runtime_) return;
     AddSwarmDialog dialog(tr("Swarm %1").arg(static_cast<qulonglong>(swarms_.size() + 1)), this);
     if (dialog.exec() != QDialog::Accepted) return;
 
@@ -304,11 +388,17 @@ void MainWindow::showSwarmInfo()
             QLocale::DataSizeIecFormat)
         : tr("%1 %2").arg(swarm.virtualSizeDisplayValue, swarm.virtualSizeDisplayUnit));
     addRow(tr("Piece size:"), tr("%1 %2").arg(swarm.pieceSizeDisplayValue, swarm.pieceSizeDisplayUnit));
+    addRow(tr("Block size:"), tr("%1 %2").arg(swarm.blockSizeDisplayValue, swarm.blockSizeDisplayUnit));
     addRow(tr("Piece count:"), locale.toString(swarm.pieceCount));
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (!runtime_) {
+        auto* edit = buttons->addButton(tr("Edit Swarm..."), QDialogButtonBox::ActionRole);
+        connect(edit, &QPushButton::clicked, &dialog, &QDialog::accept);
+    }
     layout->addWidget(buttons);
-    dialog.exec();
+    const auto id = swarm.id;
+    if (dialog.exec() == QDialog::Accepted) editSwarm(id);
 }
 
 ScenarioSwarm* MainWindow::findSwarm(quint64 id)
@@ -320,11 +410,165 @@ ScenarioSwarm* MainWindow::findSwarm(quint64 id)
 
 void MainWindow::addPeer()
 {
+    if (runtime_) return;
     const int index = swarmSelector_->currentIndex();
     if (index < 0 || static_cast<std::size_t>(index) >= swarms_.size() || canvas_->isPlacingPeer()) return;
     AddPeerDialog dialog(tr("Peer %1").arg(nextPeerId_), swarms_[index].pieceCount, this);
     if (dialog.exec() != QDialog::Accepted) return;
     auto peer = dialog.peer();
     peer.id = nextPeerId_;
+    try {
+        ensureScenarioPieces(swarms_[index], peer, scenarioSeed_);
+    } catch (const std::exception& error) {
+        QMessageBox::critical(this, tr("Add Peer"), QString::fromUtf8(error.what()));
+        return;
+    }
     canvas_->beginPeerPlacement(peer);
+}
+
+MainWindow::~MainWindow() = default;
+
+void MainWindow::play()
+{
+    if (pump_.state() == RuntimePump::State::Paused) {
+        pump_.resume();
+        return;
+    }
+    if (runtime_ || canvas_->isPlacingPeer()) return;
+    const auto showError = [this](const QString& message) {
+        QMessageBox error(QMessageBox::Critical, tr("Start Simulation"), message, QMessageBox::Ok, this);
+        error.setTextFormat(Qt::PlainText);
+        error.exec();
+    };
+    const auto validation = RuntimeSession::preflight(swarms_);
+    if (!validation.errors.isEmpty()) {
+        showError(validation.errors.join(QStringLiteral("\n")));
+        return;
+    }
+    if (validation.hasWarnings()) {
+        QString message = tr("Some swarms have configuration warnings:");
+        const auto append = [&message](const QString& title, const QStringList& names) {
+            if (!names.isEmpty()) message += QStringLiteral("\n\n") + title
+                + QStringLiteral("\n- ") + names.join(QStringLiteral("\n- "));
+        };
+        append(tr("Only one initially active peer (no peer-to-peer exchange can occur until another peer joins):"),
+            validation.singlePeerSwarms);
+        append(tr("No initially active leechers:"), validation.noLeecherSwarms);
+        append(tr("Swarms with no initially joined peers will not participate:"), validation.skippedSwarms);
+        message += tr("\n\nStart anyway?");
+        QMessageBox warning(QMessageBox::Warning, tr("Start Simulation"), message, QMessageBox::Cancel, this);
+        warning.setTextFormat(Qt::PlainText);
+        auto* start = warning.addButton(tr("Start Anyway"), QMessageBox::AcceptRole);
+        warning.setDefaultButton(QMessageBox::Cancel);
+        warning.exec();
+        if (warning.clickedButton() != start) return;
+    }
+    try {
+        const auto canvasRect = canvas_->viewportTransform().inverted()
+            .mapRect(QRectF(canvas_->viewport()->rect()));
+        runtime_ = RuntimeSession::create(swarms_, canvasRect, scenarioSeed_);
+    } catch (const std::exception& error) {
+        showError(tr("Could not create the runtime session:\n%1").arg(QString::fromUtf8(error.what())));
+        return;
+    }
+    canvas_->setEditingEnabled(false);
+    addSwarmAction_->setEnabled(false);
+    addPeerAction_->setEnabled(false);
+    eventLogModel_->removeRows(0, eventLogModel_->rowCount());
+    runtime_->simulation().setEventObserver([this](const simulator::Event& event) {
+        // Pre-execution notification, including synchronous executeNow dispatches.
+        // Copy descriptions only; never infer post-event state or retain references.
+        constexpr int maximumLogRows = 2000;
+        if (eventLogModel_->rowCount() >= maximumLogRows)
+            eventLogModel_->removeRow(0);
+        eventLogModel_->appendRow({new QStandardItem(QString::number(event.time(), 'f', 6)),
+            new QStandardItem(QString::fromStdString(event.traceDescription()))});
+    });
+    refreshInspector();
+    pump_.start(runtime_->simulation());
+}
+
+void MainWindow::updateRuntimeControls()
+{
+    const auto state = pump_.state();
+    playAction_->setEnabled(state != RuntimePump::State::Running && !canvas_->isPlacingPeer());
+    playAction_->setText(state == RuntimePump::State::Paused ? tr("Resume") : tr("Play"));
+    pauseAction_->setEnabled(state == RuntimePump::State::Running);
+    setWindowTitle(state == RuntimePump::State::Edit ? tr("picoTorrent Simulator - EDIT")
+        : state == RuntimePump::State::Running ? tr("picoTorrent Simulator - RUNNING")
+        : tr("picoTorrent Simulator - PAUSED"));
+}
+
+void MainWindow::editSwarm(quint64 id)
+{
+    if (runtime_ || canvas_->isPlacingPeer()) return;
+    auto* swarm = findSwarm(id);
+    if (!swarm) return;
+    AddSwarmDialog dialog(*swarm, this);
+    if (dialog.exec() != QDialog::Accepted) return;
+    *swarm = dialog.swarm();
+    for (int i = 0; i < swarmSelector_->count(); ++i)
+        if (swarmSelector_->itemData(i).toULongLong() == id) swarmSelector_->setItemText(i, swarm->name);
+    refreshInspector();
+}
+
+void MainWindow::refreshInspector()
+{
+    if (!inspectorContents_) return;
+    // This shared path runs after each atomic step and when a swarm is shown.
+    // Refresh all visible nodes even when no peer is selected in the Inspector.
+    if (const auto* shown = findSwarm(canvas_->shownSwarm())) {
+        canvas_->refreshPeerColors([this, shown](quint64 id) {
+            const auto peer = std::find_if(shown->peers.begin(), shown->peers.end(),
+                [id](const ScenarioPeer& value) { return value.id == id; });
+            return peer == shown->peers.end() ? PeerInspection{} : inspectPeer(*shown, *peer, runtime_.get());
+        });
+    }
+    const auto selected = canvas_->selectedPeer();
+    const auto* swarm = selected ? findSwarm(canvas_->shownSwarm()) : nullptr;
+    const ScenarioPeer* peer = nullptr;
+    if (swarm) {
+        const auto found = std::find_if(swarm->peers.begin(), swarm->peers.end(),
+            [selected](const ScenarioPeer& value) { return value.id == *selected; });
+        if (found != swarm->peers.end()) peer = &*found;
+    }
+    if (!peer) {
+        inspectorContents_->setCurrentIndex(0);
+        piecesDialog_->hide();
+        return;
+    }
+    const auto state = inspectPeer(*swarm, *peer, runtime_.get());
+    const QString status = !state.joined ? tr("Not joined")
+        : state.complete() ? tr("Seeder / Complete")
+        : !state.pieces && !state.runtime && peer->initialRole == ScenarioPeer::Role::Seeder
+            ? tr("Seeder (configured)") : tr("Leecher");
+    QString text = tr("Peer: %1\nPeer ID (scenario): %2\nSwarm: %3\n")
+        .arg(peer->name).arg(peer->id).arg(swarm->name);
+    if (state.enginePeerId) text += tr("Peer ID (engine): %1\n").arg(*state.enginePeerId);
+    text += tr("\nStatus: %1\nJoined: %2\n\nPieces: %3 / %4\nProgress: %5%\n")
+        .arg(status, state.joined ? tr("Yes") : tr("No"))
+        .arg(state.ownedPieces).arg(state.pieceCount)
+        .arg(state.pieceCount ? 100.0 * state.ownedPieces / state.pieceCount : 0, 0, 'f', 1);
+    if (state.complete() && !state.joined) text += tr("All pieces owned (not joined).\n");
+    if (!state.pieces) text += tr("Exact ownership has not been prepared for this scenario.\n");
+    const auto capacity = [](double bytes) {
+        return QStringLiteral("%1 MiB/s").arg(bytes / (1024 * 1024), 0, 'g', 6);
+    };
+    text += tr("\nUpload capacity: %1\nDownload capacity: %2")
+        .arg(capacity(state.uploadBytesPerSecond), capacity(state.downloadBytesPerSecond));
+    if (state.runtime && state.enginePeerId) {
+        text += tr("\n\nConnections: %1 (%2 established)\nChoking us: %3\nWe choke: %4"
+                   "\nInterested in us: %5\nWe are interested in: %6\nOutstanding requests: %7\nReserved requests: %8")
+            .arg(static_cast<qulonglong>(state.connections)).arg(static_cast<qulonglong>(state.established))
+            .arg(static_cast<qulonglong>(state.chokingUs)).arg(static_cast<qulonglong>(state.weChoke))
+            .arg(static_cast<qulonglong>(state.interestedInUs)).arg(static_cast<qulonglong>(state.weInterested))
+            .arg(static_cast<qulonglong>(state.outstanding)).arg(static_cast<qulonglong>(state.reserved));
+    } else if (state.runtime) text += tr("\n\nSwarm did not participate in this runtime.");
+    inspectorDetails_->setText(text);
+    inspectorContents_->setCurrentIndex(1);
+    viewPieces_->setEnabled(state.pieces.has_value());
+    if (piecesDialog_->isVisible()) {
+        if (state.pieces) piecesDialog_->setPieces(peer->name, state.pieceCount, state.ownedPieces, *state.pieces);
+        else piecesDialog_->hide();
+    }
 }

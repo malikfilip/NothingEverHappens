@@ -7,16 +7,22 @@
 
 struct ScenarioSwarm;
 class PeerNode;
+struct PeerInspection;
 
 // Presentation-only canvas. Callbacks identify scenario records without retaining pointers.
 class SimulationView : public QGraphicsView {
 public:
     explicit SimulationView(QWidget* parent = nullptr);
     void showSwarm(const ScenarioSwarm* swarm);
+    void setEditingEnabled(bool enabled);
+    void refreshPeerColors(const std::function<PeerInspection(quint64)>& inspect);
     void beginPeerPlacement(const ScenarioPeer& peer);
     void cancelPeerPlacement();
     bool isPlacingPeer() const { return pendingPeer_.has_value(); }
 
+    std::optional<quint64> selectedPeer() const { return selectedPeer_; }
+    quint64 shownSwarm() const { return swarmId_; }
+    std::function<void()> selectionChanged;
     std::function<void(quint64, const ScenarioPeer&)> peerPlaced;
     std::function<void(quint64, quint64, QPointF)> peerMoved;
     std::function<void(quint64, quint64)> peerRemoved;
@@ -33,6 +39,8 @@ protected:
     bool viewportEvent(QEvent* event) override;
 
 private:
+    void selectPeer(std::optional<quint64> id);
+    std::optional<quint64> selectedPeer_;
     PeerNode* addPeerNode(const ScenarioPeer& peer);
     void updatePreview(const QPoint& viewportPosition);
     void updateCanvasRect();
@@ -40,4 +48,5 @@ private:
     std::optional<ScenarioPeer> pendingPeer_;
     PeerNode* preview_ = nullptr;
     bool suppressContextMenu_ = false;
+    bool editingEnabled_ = true;
 };

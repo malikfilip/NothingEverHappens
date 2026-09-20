@@ -2324,10 +2324,13 @@ void completionHaveOnlyOnFirstCompletion()
     check(f.events.size() == eventCount);
 }
 
-void autonomousSequentialPipeline()
+void sequentialPipeline(std::uint32_t blockSize, bool explicitSize)
 {
-    constexpr std::uint32_t pieceLength = 4 * 16384 + 13;
-    const Swarm swarm(1, InfoHash{1}, 2 * pieceLength + 101, pieceLength);
+    const std::uint32_t pieceLength = 4 * blockSize + 13;
+    const Swarm swarm = explicitSize
+        ? Swarm(1, InfoHash{1}, 2 * pieceLength + 101, pieceLength, blockSize)
+        : Swarm(1, InfoHash{1}, 2 * pieceLength + 101, pieceLength);
+    check(swarm.blockSize() == blockSize);
     Peer seed(1, 1000000, 1000000, PeerProtocolId{1}), leecher(2, 1000000, 1000000, PeerProtocolId{2});
     seed.joinSwarm(swarm, {0xe0});
     leecher.joinSwarm(swarm);
@@ -2367,8 +2370,8 @@ void autonomousSequentialPipeline()
     simulation.run();
     std::vector<RequestPayload> expected;
     for (std::uint32_t piece = 0; piece < 2; ++piece) {
-        for (std::uint32_t block = 0; block < 4; ++block) expected.push_back({piece, block * 16384, 16384});
-        expected.push_back({piece, 65536, 13});
+        for (std::uint32_t block = 0; block < 4; ++block) expected.push_back({piece, block * blockSize, blockSize});
+        expected.push_back({piece, 4 * blockSize, 13});
     }
     expected.push_back({2, 0, 101});
     check(started == expected);
@@ -2381,6 +2384,20 @@ void autonomousSequentialPipeline()
     check(network.peer(1).swarmState(1).connections.at(2).remoteBitfield == state.localBitfield);
     check(!state.connections.at(1).weAreInterestedInRemote);
     check(!network.peer(1).swarmState(1).connections.at(2).remoteInterestedInUs);
+}
+
+void autonomousSequentialPipeline() { sequentialPipeline(16384, false); }
+void configurableBlocks() {
+    sequentialPipeline(4096, true);
+    sequentialPipeline(32768, true);
+    for (const auto invalid : {0u, 65537u}) {
+        bool rejected = false;
+        try { Swarm swarm(1, InfoHash{1}, 100000, 65536, invalid); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected);
+    }
+    const Swarm tiny(1, InfoHash{1}, 100, 100);
+    check(tiny.blockSize() == 16384); // Legacy default still clips naturally.
 }
 
 struct SchedulingFixture {
@@ -3035,6 +3052,7 @@ int main()
         {"Rarity knowledge is isolated per swarm", rarityPerSwarmIsolation},
         {"Piece completion reevaluates all swarm connections through FIFO", completionReevaluatesInterestAcrossConnections},
         {"Autonomous sequential pipeline, refill and short blocks", autonomousSequentialPipeline},
+        {"Configurable block sizes, short tails, completion and validation", configurableBlocks},
         {"Scheduler gates, duplicate reservations and unchoke resume", schedulerGatesReservationsAndResume},
         {"Scheduler excludes received/outstanding ranges across peers and swarms", schedulerSkipsReceivedAndOutstandingAcrossPeers},
         {"Scheduler replans withdrawn availability and resumes on HAVE", schedulerReplansWithdrawnAvailability},

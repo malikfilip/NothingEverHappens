@@ -33,13 +33,17 @@ void emptyAndSingleEvent()
     int executions = 0;
     int observations = 0;
     simulation.setEventObserver([&](const Event&) { ++observations; });
+    check(!simulation.nextEventTime());
     check(!simulation.step());
     check(simulation.currentTime() == 0 && observations == 0);
     simulation.schedule(std::make_unique<ActionEvent>(4, [&] {
         check(simulation.currentTime() == 4);
         ++executions;
     }));
+    check(simulation.nextEventTime() == 4);
+    check(simulation.currentTime() == 0 && observations == 0);
     check(simulation.step());
+    check(!simulation.nextEventTime());
     check(executions == 1 && observations == 1 && simulation.currentTime() == 4);
     check(!simulation.step());
     check(executions == 1 && observations == 1 && simulation.currentTime() == 4);

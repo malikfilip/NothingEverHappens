@@ -27,6 +27,15 @@ namespace simulator {
         piece_count_ = static_cast<std::uint32_t>(count);
     }
 
+    Swarm::Swarm(SwarmId id, InfoHash infoHash, std::uint64_t totalSize,
+                 std::uint32_t pieceLength, std::uint32_t blockSize)
+        : Swarm(id, infoHash, totalSize, pieceLength)
+    {
+        if (blockSize == 0 || blockSize > pieceLength)
+            throw std::invalid_argument("Block size must be positive and no larger than piece length");
+        block_size_ = blockSize;
+    }
+
     std::uint64_t Swarm::totalSize() const { return total_size_; }
     std::uint32_t Swarm::pieceLength() const { return piece_length_; }
 

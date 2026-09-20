@@ -16,6 +16,7 @@ struct ScenarioSwarm {
     quint64 totalSizeBytes = 0;
     quint64 pieceSizeBytes = 0;
     quint64 pieceCount = 0;
+    quint64 blockSizeBytes = 16 * 1024;
     std::vector<ScenarioPeer> peers;
     QPointF trackerPosition; // Visualization only; independent for each swarm.
 
@@ -24,4 +25,6 @@ struct ScenarioSwarm {
     QString virtualSizeDisplayUnit;
     QString pieceSizeDisplayValue;
     QString pieceSizeDisplayUnit;
+    QString blockSizeDisplayValue = QStringLiteral("16");
+    QString blockSizeDisplayUnit = QStringLiteral("KiB");
 };

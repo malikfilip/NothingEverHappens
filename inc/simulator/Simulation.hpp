@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "simulator/Event.hpp"
@@ -29,6 +30,8 @@ namespace simulator {
         void run();
 
         double currentTime() const;
+        // Read-only peek; does not execute events or advance logical time.
+        std::optional<double> nextEventTime() const;
 
     private:
         void executeEvent(Event& event);

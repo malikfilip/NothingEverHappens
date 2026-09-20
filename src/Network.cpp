@@ -18,7 +18,6 @@
 namespace simulator {
 
     namespace {
-        constexpr std::uint32_t requestBlockSize = 16 * 1024;
         constexpr std::size_t requestPipelineDepth = 5;
     }
 
@@ -273,12 +272,12 @@ namespace simulator {
         for (const auto& range : occupied) {
             if (range.end <= begin) continue;
             if (range.begin > begin) {
-                return RequestPayload{piece, begin, std::min(requestBlockSize, range.begin - begin)};
+                return RequestPayload{piece, begin, std::min(swarm.blockSize(), range.begin - begin)};
             }
             begin = range.end;
         }
         if (begin >= size) return std::nullopt;
-        return RequestPayload{piece, begin, std::min(requestBlockSize, size - begin)};
+        return RequestPayload{piece, begin, std::min(swarm.blockSize(), size - begin)};
     }
 
     std::optional<std::uint32_t> Network::selectPiece(const Swarm& swarm,

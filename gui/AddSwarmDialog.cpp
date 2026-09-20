@@ -95,12 +95,17 @@ AddSwarmDialog::AddSwarmDialog(const QString& defaultName, QWidget* parent)
     grid->addWidget(pieceLabel, 5, 0);
     grid->addWidget(pieceSize_, 5, 1);
     grid->addWidget(pieceUnit_, 5, 2);
-    pieces_ = new QLineEdit(this);
-    pieces_->setReadOnly(true);
-    auto* piecesLabel = new QLabel(tr("Pieces:"), this);
-    piecesLabel->setBuddy(pieces_);
-    grid->addWidget(piecesLabel, 6, 0);
-    grid->addWidget(pieces_, 6, 1, 1, 3);
+    blockSize_ = makeSizeInput(QStringLiteral("16"));
+    blockUnit_ = makeUnits(false);
+    auto* blockLabel = new QLabel(tr("Block size:"), this);
+    blockLabel->setBuddy(blockSize_);
+    grid->addWidget(blockLabel, 6, 0);
+    grid->addWidget(blockSize_, 6, 1);
+    grid->addWidget(blockUnit_, 6, 2);
+    geometrySummary_ = new QLabel(this);
+    geometrySummary_->setWordWrap(true);
+    geometrySummary_->setTextFormat(Qt::PlainText);
+    grid->addWidget(geometrySummary_, 7, 0, 1, 4);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, this);
     create_ = buttons->addButton(tr("Create"), QDialogButtonBox::AcceptRole);
@@ -123,39 +128,109 @@ AddSwarmDialog::AddSwarmDialog(const QString& defaultName, QWidget* parent)
         updateValues();
     });
     connect(fileMode_, &QRadioButton::toggled, this, &AddSwarmDialog::updateValues);
-    for (auto* input : {name_, virtualSize_, pieceSize_})
+    for (auto* input : {name_, virtualSize_, pieceSize_, blockSize_})
         connect(input, &QLineEdit::textChanged, this, &AddSwarmDialog::updateValues);
-    for (auto* unit : {virtualUnit_, pieceUnit_})
+    for (auto* unit : {virtualUnit_, pieceUnit_, blockUnit_})
         connect(unit, &QComboBox::currentIndexChanged, this, &AddSwarmDialog::updateValues);
     updateValues();
     name_->selectAll();
     name_->setFocus();
 }
 
+AddSwarmDialog::AddSwarmDialog(const ScenarioSwarm& swarm, QWidget* parent)
+    : AddSwarmDialog(swarm.name, parent)
+{
+    original_ = swarm;
+    editing_ = true;
+    setWindowTitle(tr("Edit Swarm"));
+    create_->setText(tr("Save"));
+    filePath_ = swarm.filePath;
+    fileSizeBytes_ = swarm.totalSizeBytes;
+    // Preserve saved units when valid, and never round exact byte metadata.
+    auto restore = [](QLineEdit* value, QComboBox* units, quint64 bytes,
+                      const QString& savedValue, const QString& savedUnit) {
+        const int savedIndex = units->findText(savedUnit);
+        if (savedIndex >= 0) {
+            units->setCurrentIndex(savedIndex);
+            value->setText(savedValue);
+            if (sizeInBytes(value, units) == bytes) return;
+        }
+        for (int i = units->count() - 1; i >= 0; --i) {
+            const auto multiplier = units->itemData(i).toULongLong();
+            if (bytes >= multiplier && bytes % multiplier == 0) {
+                units->setCurrentIndex(i);
+                value->setText(QString::number(bytes / multiplier));
+                return;
+            }
+        }
+        // Compatibility for programmatically created scenarios with sub-KiB sizes.
+        units->addItem(QStringLiteral("B"), QVariant::fromValue(quint64{1}));
+        units->setCurrentIndex(units->count() - 1);
+        value->setText(QString::number(bytes));
+    };
+    restore(virtualSize_, virtualUnit_, swarm.totalSizeBytes, swarm.virtualSizeDisplayValue, swarm.virtualSizeDisplayUnit);
+    restore(pieceSize_, pieceUnit_, swarm.pieceSizeBytes, swarm.pieceSizeDisplayValue, swarm.pieceSizeDisplayUnit);
+    restore(blockSize_, blockUnit_, swarm.blockSizeBytes, swarm.blockSizeDisplayValue, swarm.blockSizeDisplayUnit);
+    for (auto* radio : findChildren<QRadioButton*>())
+        radio->setChecked(radio == fileMode_ ? swarm.mode == ScenarioSwarm::Mode::File
+                                          : swarm.mode == ScenarioSwarm::Mode::Virtual);
+    // Existing ownership is indexed by piece. Keep its geometry when peers exist.
+    if (!swarm.peers.empty()) {
+        pieceSize_->setEnabled(false);
+        pieceUnit_->setEnabled(false);
+        for (auto* radio : findChildren<QRadioButton*>()) radio->setEnabled(false);
+        pieceSize_->setToolTip(tr("Piece size is fixed once peers have been added."));
+    }
+    updateFileLabel();
+    updateValues();
+}
+
 void AddSwarmDialog::updateValues()
 {
     const bool fileMode = fileMode_->isChecked();
-    browse_->setEnabled(fileMode);
-    virtualSize_->setEnabled(!fileMode);
-    virtualUnit_->setEnabled(!fileMode);
-    totalSizeBytes_ = fileMode ? fileSizeBytes_ : sizeInBytes(virtualSize_, virtualUnit_);
-    pieceSizeBytes_ = sizeInBytes(pieceSize_, pieceUnit_);
+    const bool locked = editing_ && !original_.peers.empty();
+    browse_->setEnabled(fileMode && !locked);
+    virtualSize_->setEnabled(!fileMode && !locked);
+    virtualUnit_->setEnabled(!fileMode && !locked);
+    totalSizeBytes_ = locked ? original_.totalSizeBytes
+        : fileMode ? fileSizeBytes_ : sizeInBytes(virtualSize_, virtualUnit_);
+    pieceSizeBytes_ = locked ? original_.pieceSizeBytes : sizeInBytes(pieceSize_, pieceUnit_);
+    blockSizeBytes_ = sizeInBytes(blockSize_, blockUnit_);
+    const bool validBlock = blockSizeBytes_ > 0 && blockSizeBytes_ <= pieceSizeBytes_;
     const bool validSizes = totalSizeBytes_ > 0 && pieceSizeBytes_ > 0;
     pieceCount_ = validSizes ? totalSizeBytes_ / pieceSizeBytes_
         + (totalSizeBytes_ % pieceSizeBytes_ != 0) : 0;
-    pieces_->setText(validSizes ? QString::number(pieceCount_) : QStringLiteral("?"));
-    create_->setEnabled(!name_->text().trimmed().isEmpty() && validSizes);
+    if (totalSizeBytes_ == 0) {
+        geometrySummary_->setText(tr("Select a file or virtual size to calculate pieces and blocks."));
+    } else if (!validSizes || !validBlock) {
+        geometrySummary_->setText(tr("Piece and block sizes must be positive, and block size must not exceed piece size."));
+    } else {
+        const quint64 blocksPerPiece = pieceSizeBytes_ / blockSizeBytes_
+            + (pieceSizeBytes_ % blockSizeBytes_ != 0);
+        const quint64 fullPieces = totalSizeBytes_ / pieceSizeBytes_;
+        const quint64 tailBytes = totalSizeBytes_ % pieceSizeBytes_;
+        // Count the shorter final piece separately. Counts cannot exceed total bytes.
+        const quint64 totalBlocks = fullPieces * blocksPerPiece
+            + tailBytes / blockSizeBytes_ + (tailBytes % blockSizeBytes_ != 0);
+        const QLocale locale;
+        geometrySummary_->setText(tr("File has %1 pieces and %2 blocks (%3 per full piece).")
+            .arg(locale.toString(pieceCount_), locale.toString(totalBlocks), locale.toString(blocksPerPiece)));
+    }
+    create_->setEnabled(!name_->text().trimmed().isEmpty() && validSizes && validBlock);
 }
 
 ScenarioSwarm AddSwarmDialog::swarm() const
 {
-    ScenarioSwarm result;
+    ScenarioSwarm result = original_;
     result.name = name_->text().trimmed();
     result.mode = fileMode_->isChecked() ? ScenarioSwarm::Mode::File : ScenarioSwarm::Mode::Virtual;
     result.filePath = fileMode_->isChecked() ? filePath_ : QString{};
     result.totalSizeBytes = totalSizeBytes_;
     result.pieceSizeBytes = pieceSizeBytes_;
     result.pieceCount = pieceCount_;
+    result.blockSizeBytes = blockSizeBytes_;
+    result.blockSizeDisplayValue = blockSize_->text();
+    result.blockSizeDisplayUnit = blockUnit_->currentText();
     if (result.mode == ScenarioSwarm::Mode::Virtual) {
         result.virtualSizeDisplayValue = virtualSize_->text();
         result.virtualSizeDisplayUnit = virtualUnit_->currentText();
