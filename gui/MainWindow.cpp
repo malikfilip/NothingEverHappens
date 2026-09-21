@@ -752,6 +752,8 @@ void MainWindow::editSwarm(quint64 id)
 void MainWindow::refreshInspector()
 {
     if (!inspectorContents_) return;
+    canvas_->refreshRuntimeLinks(inspectRuntimeLinks(runtime_.get(),
+        canvas_->shownSwarm(), canvas_->selectedPeer()));
     // This shared path runs after each atomic step and when a swarm is shown.
     // Refresh all visible nodes even when no peer is selected in the Inspector.
     if (const auto* shown = findSwarm(canvas_->shownSwarm())) {

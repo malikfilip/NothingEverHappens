@@ -30,6 +30,7 @@ set_target_properties(picoTorrent_gui PROPERTIES
 
 target_sources(picotorrent_runtime PRIVATE
     RuntimeSession.hpp RuntimeSession.cpp RuntimePump.hpp PlaybackClock.hpp
+    RuntimeLinks.hpp RuntimeLinks.cpp
     ScenarioPersistence.hpp ScenarioPersistence.cpp
     ScenarioPieces.hpp ScenarioPieces.cpp PeerInspection.hpp PeerInspection.cpp
     ../src/Simulation.cpp ../src/Peer.cpp ../src/Link.cpp ../src/Message.cpp
@@ -41,6 +42,9 @@ target_link_libraries(picotorrent_runtime PUBLIC Qt6::Core)
 target_link_libraries(picoTorrent_gui PRIVATE picotorrent_runtime Qt6::Widgets)
 
 if(BUILD_TESTING)
+    add_executable(runtime_links_tests ../tests/RuntimeLinksTests.cpp)
+    target_link_libraries(runtime_links_tests PRIVATE picotorrent_runtime)
+    add_test(NAME runtime_links COMMAND runtime_links_tests)
     add_executable(runtime_session_tests ../tests/RuntimeSessionTests.cpp)
     target_link_libraries(runtime_session_tests PRIVATE picotorrent_runtime)
     add_test(NAME runtime_session COMMAND runtime_session_tests)

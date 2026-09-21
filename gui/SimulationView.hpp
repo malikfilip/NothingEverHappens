@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ScenarioPeer.hpp"
+#include "RuntimeLinks.hpp"
 #include <QGraphicsView>
 #include <functional>
 #include <optional>
@@ -16,6 +17,7 @@ public:
     void showSwarm(const ScenarioSwarm* swarm);
     void setEditingEnabled(bool enabled);
     void refreshPeerColors(const std::function<PeerInspection(quint64)>& inspect);
+    void refreshRuntimeLinks(std::vector<RuntimeWire> wires);
     void beginPeerPlacement(const ScenarioPeer& peer);
     void cancelPeerPlacement();
     bool isPlacingPeer() const { return pendingPeer_.has_value(); }
@@ -39,6 +41,9 @@ protected:
     bool viewportEvent(QEvent* event) override;
 
 private:
+    void drawRuntimeLinks();
+    std::vector<RuntimeWire> runtimeWires_;
+    std::vector<QGraphicsItem*> wireItems_;
     void selectPeer(std::optional<quint64> id);
     std::optional<quint64> selectedPeer_;
     PeerNode* addPeerNode(const ScenarioPeer& peer);
