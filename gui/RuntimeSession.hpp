@@ -33,10 +33,15 @@ public:
         std::vector<std::uint8_t> initialBitfield;
     };
 
-    static PlayPreflight preflight(const std::vector<ScenarioSwarm>& scenario);
+    // EDIT validation includes inactive swarms and permits an empty project.
+    // Playback retains participation requirements and skips inactive swarms.
+    static PlayPreflight preflight(const std::vector<ScenarioSwarm>& scenario, bool forPlayback = true);
     // Strong transaction: scenario ownership is published only after complete startup.
     static std::unique_ptr<RuntimeSession> create(std::vector<ScenarioSwarm>& scenario,
         const QRectF& visibleCanvas, std::uint64_t seed = 0, ScenarioSettings settings = {});
+
+    // Publish only completed ownership and membership; strong transaction.
+    void snapshotToScenario(std::vector<ScenarioSwarm>& scenario) const;
 
     RuntimeSession(const RuntimeSession&) = delete;
     RuntimeSession& operator=(const RuntimeSession&) = delete;

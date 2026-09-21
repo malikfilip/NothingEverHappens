@@ -220,6 +220,116 @@ void blockConfigurationAndInspection()
     check(session->network().links().size() == 1, "Inspection changed lazy link topology");
 }
 
+void snapshotAndFreshRestart()
+{
+    auto active = swarm(101, 6);
+    active.blockSizeBytes = 256;
+    active.peers = {
+        peer(11, true, ScenarioPeer::Role::Seeder, 6),
+        peer(12, true, ScenarioPeer::Role::Leecher, 3),
+        peer(13, false, ScenarioPeer::Role::Leecher, 1),
+        peer(14, true, ScenarioPeer::Role::Seeder, 6),
+        peer(15, false, ScenarioPeer::Role::Leecher, 1)};
+    active.peers[1].initialBitfield = std::vector<std::uint8_t>{0xa8}; // Exactly {0,2,4}.
+    active.peers[2].initialBitfield = std::vector<std::uint8_t>{0x40};
+    active.peers[4].initialBitfield = std::vector<std::uint8_t>{0x40};
+    auto skipped = swarm(202, 6);
+    skipped.peers = {peer(21, false, ScenarioPeer::Role::Leecher, 1)};
+    std::vector<ScenarioSwarm> input{active, skipped};
+    auto session = RuntimeSession::create(input, {0,0,100,100});
+    const auto download = session->peerBindings().at(12);
+    const auto& state = session->network().peer(download.peerId).swarmState(download.swarmId);
+    bool partial = false;
+    for (unsigned i = 0; i < 10000 && session->simulation().step(); ++i) {
+        for (const auto& [piece, ranges] : state.receivedBlocks)
+            partial |= !ranges.empty() && !(state.localBitfield[piece / 8] & (0x80 >> (piece % 8)));
+        if (partial) break;
+    }
+    check(partial && state.localBitfield == std::vector<std::uint8_t>{0xa8},
+        "Fixture did not stop within the first incomplete piece");
+    check(session->simulation().currentTime() > 0 && session->simulation().nextEventTime(),
+        "Fixture needs live scheduled work");
+    check(!state.connections.empty() && !session->network().links().empty()
+        && !session->network().activeTransmissions().empty(), "Fixture needs runtime transport state");
+    // Drive existing lifecycle APIs in this headless test; GUI has read-only access.
+    auto& net = const_cast<simulator::Network&>(session->network());
+    const auto departed = session->peerBindings().at(14);
+    net.leaveSwarm(departed.swarmId, departed.peerId);
+    const auto joined = session->peerBindings().at(15);
+    simulator::JoinOptions options;
+    options.initialBitfield = joined.initialBitfield;
+    net.joinSwarm(joined.swarmId, joined.peerId, options);
+    session->snapshotToScenario(input);
+    check(input[0].peers[1].initialBitfield == std::vector<std::uint8_t>{0xa8}
+        && input[0].peers[1].initialPieceCount == 3, "Exact non-prefix ownership was lost");
+    check(input[0].peers[1].initiallyJoined && !input[0].peers[3].initiallyJoined
+        && input[0].peers[4].initiallyJoined && !input[0].peers[2].initiallyJoined,
+        "Runtime membership was not snapshotted");
+    check(input[0].peers[3].initialBitfield == std::vector<std::uint8_t>{0xfc}
+        && input[0].peers[2].initialBitfield == std::vector<std::uint8_t>{0x40},
+        "Inactive or never-joined inventory was lost");
+    check(!input[1].peers[0].initialBitfield && !input[1].peers[0].initiallyJoined,
+        "Skipped swarm was modified");
+    check(input[0].peers[1].name == active.peers[1].name
+        && input[0].peers[1].uploadBytesPerSecond == active.peers[1].uploadBytesPerSecond,
+        "Snapshot changed unrelated scenario settings");
+    session.reset();
+
+    auto fresh = RuntimeSession::create(input, {0,0,100,100}, 999);
+    check(fresh->simulation().currentTime() == 0 && fresh->simulation().nextEventTime() == 0,
+        "Restart retained old time or queue");
+    check(fresh->network().links().empty() && fresh->network().activeTransmissions().empty(),
+        "Restart retained old links/transfers");
+    for (const auto& [id, binding] : fresh->peerBindings()) {
+        const auto& engine = fresh->network().peer(binding.peerId);
+        if (!engine.hasSwarm(binding.swarmId)) continue;
+        const auto& saved = engine.swarmState(binding.swarmId);
+        check(saved.localBitfield == binding.initialBitfield && saved.receivedBlocks.empty(),
+            "Restart lost bitmap or retained partial block progress");
+        check(saved.connections.empty() && !saved.choking.managed && !saved.choking.cycleActive
+            && !saved.choking.eventPending && saved.choking.preferred.empty() && !saved.choking.optimistic,
+            "Restart retained requests/connections/choking state");
+        check(fresh->network().tracker().registeredPeers(fresh->network().swarm(binding.swarmId).infoHash()).empty(),
+            "Restart reused tracker state");
+    }
+    unsigned started = 0;
+    fresh->simulation().setEventObserver([&](const simulator::Event& e) {
+        const auto* announce = dynamic_cast<const simulator::TrackerAnnounceEvent*>(&e);
+        check(announce && announce->kind() == simulator::AnnounceKind::Started && e.time() == 0,
+            "Restart executed an old queued event");
+        ++started;
+    });
+    for (unsigned i = 0; i < 3; ++i) check(fresh->simulation().step(), "Missing fresh STARTED event");
+    check(started == 3, "Wrong fresh membership count");
+}
+
+void completedSnapshot()
+{
+    auto s = swarm(1, 2);
+    s.peers = {peer(1, true, ScenarioPeer::Role::Seeder, 2),
+        peer(2, true, ScenarioPeer::Role::Leecher, 0)};
+    std::vector<ScenarioSwarm> input{s};
+    auto session = RuntimeSession::create(input, {0,0,100,100});
+    bool complete = false;
+    for (unsigned i = 0; i < 10000 && session->simulation().step(); ++i) {
+        if (inspectPeer(input[0], input[0].peers[1], session.get()).complete()) {
+            complete = true;
+            break;
+        }
+    }
+    check(complete, "Leecher did not finish");
+    session->snapshotToScenario(input);
+    session.reset();
+    const auto edit = inspectPeer(input[0], input[0].peers[1], nullptr);
+    check(edit.complete() && edit.joined && edit.pieces == std::vector<std::uint8_t>{0xc0},
+        "Completed leecher did not become complete in EDIT");
+    check(RuntimeSession::preflight(input).errors.empty(), "Snapshot failed scenario validation");
+    auto fresh = RuntimeSession::create(input, {0,0,100,100});
+    check(fresh->simulation().currentTime() == 0
+        && fresh->network().peer(2).swarmState(1).localBitfield == std::vector<std::uint8_t>{0xc0},
+        "Completed inventory did not survive fresh Play");
+}
+
 void settingsSnapshot()
 {
     ScenarioSettings settings;
@@ -330,6 +440,8 @@ void deterministicOwnershipAndGeometry()
 int main()
 {
     try {
+        snapshotAndFreshRestart();
+        completedSnapshot();
         settingsSnapshot();
         settingsReachChoking();
         preflight();

@@ -73,9 +73,9 @@ provider geometry.
 
 Successful startup enters runtime mode, disables Play/Add Swarm/Add Peer and
 canvas editing/context actions, and preserves viewing/swarm selection/help.
-The title reports RUNNING or PAUSED. Stop remains disabled. Next Event executes one queued event while paused. Pause and
+The title reports RUNNING or PAUSED. Stop snapshots completed pieces and membership, destroys the session, and returns to EDIT. Next Event executes one queued event while paused. Pause and
 Resume control the event pump. Closing the application releases the session;
-no Stop or reset behavior is simulated.
+Stop creates no engine lifecycle events; the next Play constructs a fresh session.
 
 Engine piece length/count and numeric runtime IDs are uint32_t, while the editor
 allows larger sizes/IDs. Oversized piece lengths/counts reject; scenario IDs are
@@ -96,7 +96,7 @@ The existing seven engine tests remain registered and unchanged.
 RuntimePump is a Qt Core controller owned by MainWindow, destroyed before its
 RuntimeSession. EDIT -> successful validation/session creation -> RUNNING;
 RUNNING -> Pause -> PAUSED; PAUSED -> Resume -> RUNNING. Validation cancellation
-or failure leaves EDIT. No transition back to EDIT or Stop is implemented.
+or failure leaves EDIT. Stop returns to EDIT after snapshotting completed ownership and membership.
 Structural editing stays locked in both runtime states.
 
 A single-shot precise QTimer executes at most one Simulation::step() per timeout
@@ -121,8 +121,7 @@ An exception also pauses and displays the error; failed events are not rolled ba
 The two-column Event Log copies event.time() and traceDescription() directly
 from Simulation's pre-execution observer, including synchronous executeNow
 notifications in dispatch order. It does not imply post-event success or inspect
-post-event state. Stale/no-op events may therefore appear. The log clears only
-on new session creation, preserves entries across Pause/Resume, and scrolls to
+post-event state. Stale/no-op events may therefore appear. The log clears on Stop and new session creation, preserves entries across Pause/Resume, and scrolls to
 the bottom after each step. It retains at most 2,000 rows, removing the oldest
 GUI row before appending; the engine is unaffected. Toolbar time displays GUI playback time as total minutes:ss.mmm. It advances between events while running and freezes on Pause. Message Filter remains disconnected.
 
@@ -168,8 +167,7 @@ integer-multiple constraint applies. The dialog supports 0.001..86400 seconds
 with millisecond precision and commits only on valid OK. Cancel discards edits.
 
 RuntimeSession validates and stores an immutable copy at creation. Settings are
-disabled whenever a session exists, including pause/error states. Stop remains
-unimplemented. The shared engine BitTorrentSettings type reaches Network through
+disabled whenever a session exists, including pause/error states. Stop restores Settings in EDIT. The shared engine BitTorrentSettings type reaches Network through
 RuntimeSession and controls bootstrap plus peer/swarm-local choking deadlines.
 For regular=5, first actionable interest at T immediately fills available upload
 slots, with full preferred decisions at T+5, T+10, T+15. Optimistic timing is
@@ -200,5 +198,26 @@ MainWindow queues names from these notifications, refreshes the existing peer
 colors after the atomic step, and pauses before showing one asynchronous modal
 popup at a time. Continue (or closing the popup) resumes only after the queue is
 empty and only if the run was active before presentation. Completion reached by
-paused Next Event stays paused. Stop Simulation is disabled because central Stop
-semantics are not implemented.
+paused Next Event stays paused. Stop Simulation invokes the same MainWindow::stopSimulation() as toolbar Stop.
+
+## Stop and fresh Play
+
+MainWindow::stopSimulation is the only Stop lifecycle, shared by toolbar Stop and
+completion-popup Stop. It first pauses the pump, then transactionally snapshots
+RuntimeSession into the scenario. RuntimePump::stop cancels its timers, detaches
+the engine pointer and resets playback to zero before the session is destroyed.
+The completion timer, queued messages, open popup, resume intent and Event Log
+are cleared. Canvas editing, Settings and add controls return; colors and Inspector
+refresh from the scenario. Stop with no session does nothing. If snapshotting
+fails, the scenario is unchanged and the old session remains paused for retry.
+
+Only each peer's exact localBitfield and active membership survive. Saved inactive
+memberships retain their completed pieces; never-joined peers retain their initial
+bitmap. Skipped swarms remain unchanged. Existing editor count and role fields
+are derived from the copied bitmap to keep preflight consistent; bitmap ownership
+remains the source of truth. Positions, names, capacities and settings are retained.
+
+No receivedBlocks are copied: an incomplete piece loses all partial block progress.
+Time, event queue, tracker state, connections/links, transfers, request reservations
+and choking assignments/deadlines disappear with RuntimeSession. Next Play creates
+a new session at t=0 with fresh STARTED events and exact saved completed pieces.

@@ -7,6 +7,10 @@
 #include "SimulationView.hpp"
 #include "RuntimeSession.hpp"
 #include "ScenarioPieces.hpp"
+#include "ScenarioPersistence.hpp"
+#include <QFileDialog>
+#include <QSignalBlocker>
+#include <set>
 #include "PeerInspection.hpp"
 #include "PieceBitmapDialog.hpp"
 
@@ -43,6 +47,13 @@
 #include <QVBoxLayout>
 
 namespace {
+quint64 availableScenarioId(const std::set<quint64>& used)
+{
+    quint64 id = 1;
+    while (used.contains(id)) ++id;
+    return id;
+}
+
 QIcon settingsIcon(const QPalette& palette)
 {
     // QStyle has no portable gear icon. Paint a palette-aware fallback using Qt.
@@ -88,6 +99,9 @@ MainWindow::MainWindow(QWidget* parent)
     resize(1280, 820);
     setMinimumSize(640, 480);
     createToolbar();
+    completionTimer_.setSingleShot(true);
+    completionTimer_.setInterval(0);
+    connect(&completionTimer_, &QTimer::timeout, this, &MainWindow::showNextCompletion);
     pump_.playbackChanged = [this] {
         simulationTime_->setText(simulationTimeText(pump_.playbackTime()));
     };
@@ -190,17 +204,15 @@ void MainWindow::createToolbar()
     toolbar->setMovable(false);
     toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 
-    auto disable = [this](QAction* action) {
-        action->setEnabled(false);
-        action->setToolTip(tr("Not connected yet."));
-    };
     addSwarmAction_ = toolbar->addAction(tr("+ Swarm"));
     connect(addSwarmAction_, &QAction::triggered, this, &MainWindow::addSwarm);
     addPeerAction_ = toolbar->addAction(tr("+ Peer"));
     addPeerAction_->setEnabled(false);
     connect(addPeerAction_, &QAction::triggered, this, &MainWindow::addPeer);
     toolbar->addSeparator();
-    disable(toolbar->addAction(style()->standardIcon(QStyle::SP_MediaStop), tr("Stop")));
+    stopAction_ = toolbar->addAction(style()->standardIcon(QStyle::SP_MediaStop), tr("Stop"));
+    stopAction_->setEnabled(false);
+    connect(stopAction_, &QAction::triggered, this, &MainWindow::stopSimulation);
     playAction_ = toolbar->addAction(style()->standardIcon(QStyle::SP_MediaPlay), tr("Play"));
     connect(playAction_, &QAction::triggered, this, &MainWindow::play);
     pauseAction_ = toolbar->addAction(style()->standardIcon(QStyle::SP_MediaPause), tr("Pause"));
@@ -248,6 +260,10 @@ void MainWindow::createToolbar()
     auto* spacer = new QWidget(toolbar);
     spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     toolbar->addWidget(spacer);
+    importAction_ = toolbar->addAction(tr("Import"));
+    exportAction_ = toolbar->addAction(tr("Export"));
+    connect(importAction_, &QAction::triggered, this, &MainWindow::importScenario);
+    connect(exportAction_, &QAction::triggered, this, &MainWindow::exportScenario);
     settingsAction_ = toolbar->addAction(settingsIcon(palette()), tr("Settings"));
     settingsAction_->setObjectName("simulationSettingsAction");
     connect(settingsAction_, &QAction::triggered, this, &MainWindow::showSettings);
@@ -267,6 +283,57 @@ void MainWindow::showSettings()
     if (runtime_) return;
     SimulationSettingsDialog dialog(settings_, this);
     if (dialog.exec() == QDialog::Accepted) settings_ = dialog.settings();
+}
+
+void MainWindow::exportScenario()
+{
+    if (runtime_ || pump_.state() != RuntimePump::State::Edit) return;
+    QFileDialog dialog(this, tr("Export Scenario"));
+    dialog.setAcceptMode(QFileDialog::AcceptSave);
+    dialog.setNameFilter(tr("picoTorrent Scenario (*.pt)"));
+    dialog.setDefaultSuffix(QStringLiteral("pt"));
+    if (dialog.exec() != QDialog::Accepted) return;
+    try {
+        ScenarioPersistence::save(dialog.selectedFiles().front(), {swarms_, settings_, scenarioSeed_});
+    } catch (const std::exception& error) {
+        QMessageBox::critical(this, tr("Export Scenario"), QString::fromUtf8(error.what()));
+    }
+}
+
+void MainWindow::importScenario()
+{
+    if (runtime_ || pump_.state() != RuntimePump::State::Edit) return;
+    QFileDialog dialog(this, tr("Import Scenario"));
+    dialog.setFileMode(QFileDialog::ExistingFile);
+    dialog.setNameFilter(tr("picoTorrent Scenario (*.pt)"));
+    dialog.setDefaultSuffix(QStringLiteral("pt"));
+    if (dialog.exec() != QDialog::Accepted) return;
+    ScenarioProject imported;
+    try {
+        imported = ScenarioPersistence::load(dialog.selectedFiles().front());
+    } catch (const std::exception& error) {
+        QMessageBox::critical(this, tr("Import Scenario"), QString::fromUtf8(error.what()));
+        return; // No editor changes until the complete document has validated.
+    }
+    canvas_->showSwarm(nullptr); // Cancel placement and selection from the old project.
+    swarms_.swap(imported.swarms);
+    settings_ = imported.settings;
+    scenarioSeed_ = imported.seed;
+    nextPeerId_ = 1; // addPeer chooses an unused ID across all imported swarms.
+    {
+        const QSignalBlocker blocked(swarmSelector_);
+        swarmSelector_->clear();
+        for (const auto& swarm : swarms_)
+            swarmSelector_->addItem(swarm.name, QVariant::fromValue(swarm.id));
+        swarmSelector_->setCurrentIndex(-1);
+        swarmSelector_->setEnabled(!swarms_.empty());
+    }
+    swarmInfo_->setEnabled(!swarms_.empty());
+    if (!swarms_.empty()) swarmSelector_->setCurrentIndex(0);
+    eventLogModel_->removeRows(0, eventLogModel_->rowCount());
+    pump_.stop();
+    refreshInspector();
+    updateRuntimeControls();
 }
 
 QWidget* MainWindow::createInspector()
@@ -407,7 +474,9 @@ void MainWindow::addSwarm()
     if (dialog.exec() != QDialog::Accepted) return;
 
     auto swarm = dialog.swarm();
-    swarm.id = static_cast<quint64>(swarms_.size()) + 1;
+    std::set<quint64> usedIds;
+    for (const auto& existing : swarms_) usedIds.insert(existing.id);
+    swarm.id = availableScenarioId(usedIds);
     swarms_.push_back(swarm);
     swarmSelector_->addItem(swarm.name, QVariant::fromValue(swarm.id));
     swarmSelector_->setEnabled(true);
@@ -468,6 +537,10 @@ void MainWindow::addPeer()
     if (runtime_) return;
     const int index = swarmSelector_->currentIndex();
     if (index < 0 || static_cast<std::size_t>(index) >= swarms_.size() || canvas_->isPlacingPeer()) return;
+    std::set<quint64> usedIds;
+    for (const auto& swarm : swarms_)
+        for (const auto& peer : swarm.peers) usedIds.insert(peer.id);
+    nextPeerId_ = availableScenarioId(usedIds);
     AddPeerDialog dialog(tr("Peer %1").arg(nextPeerId_), swarms_[index].pieceCount, this);
     if (dialog.exec() != QDialog::Accepted) return;
     auto peer = dialog.peer();
@@ -545,6 +618,43 @@ void MainWindow::play()
     pump_.start(runtime_->simulation());
 }
 
+void MainWindow::stopSimulation()
+{
+    if (!runtime_) return;
+    // Qt callbacks run on one thread: pause prevents another step throughout
+    // this transaction. Never enter a modal loop until snapshotting has finished.
+    pump_.pause();
+    try {
+        runtime_->snapshotToScenario(swarms_);
+    } catch (const std::exception& error) {
+        presentingCompletions_ = false;
+        resumeAfterCompletions_ = false;
+        completionTimer_.stop();
+        updateRuntimeControls();
+        QMessageBox::critical(this, tr("Stop Simulation"),
+            tr("Could not save peer state. The session remains paused:\n%1")
+                .arg(QString::fromUtf8(error.what())));
+        return;
+    }
+    pump_.stop(); // Cancel timers and detach its Simulation pointer before destruction.
+    runtime_.reset();
+
+    completionTimer_.stop();
+    completionMessages_.clear();
+    presentingCompletions_ = false;
+    resumeAfterCompletions_ = false;
+    if (completionPopup_) {
+        disconnect(completionPopup_, nullptr, this, nullptr);
+        completionPopup_->close();
+        completionPopup_ = nullptr;
+    }
+    eventLogModel_->removeRows(0, eventLogModel_->rowCount());
+    canvas_->setEditingEnabled(true);
+    simulationTime_->setText(simulationTimeText(0));
+    refreshInspector();
+    updateRuntimeControls();
+}
+
 void MainWindow::queueCompletion(simulator::PeerId peerId, simulator::SwarmId swarmId)
 {
     // Capture names now; do not retain engine-event references or infer from colors.
@@ -570,11 +680,12 @@ void MainWindow::presentCompletions()
     pump_.pause();
     updateRuntimeControls();
     // Leave the atomic engine step and its observer before entering any dialog.
-    QTimer::singleShot(0, this, [this] { showNextCompletion(); });
+    completionTimer_.start();
 }
 
 void MainWindow::showNextCompletion()
 {
+    if (!runtime_ || !presentingCompletions_) return;
     if (completionMessages_.empty()) {
         presentingCompletions_ = false;
         const bool resume = std::exchange(resumeAfterCompletions_, false);
@@ -584,6 +695,7 @@ void MainWindow::showNextCompletion()
     }
     auto* popup = new QMessageBox(QMessageBox::Information, tr("Download complete"),
         completionMessages_.front(), QMessageBox::NoButton, this);
+    completionPopup_ = popup;
     completionMessages_.pop_front();
     popup->setTextFormat(Qt::PlainText);
     popup->setWindowModality(Qt::ApplicationModal);
@@ -592,10 +704,13 @@ void MainWindow::showNextCompletion()
     popup->setDefaultButton(proceed);
     popup->setEscapeButton(proceed);
     auto* stop = popup->addButton(tr("Stop Simulation"), QMessageBox::DestructiveRole);
-    stop->setEnabled(false);
-    stop->setToolTip(tr("Stop Simulation is not implemented yet."));
-    connect(popup, &QDialog::finished, this, [this] {
-        QTimer::singleShot(0, this, [this] { showNextCompletion(); });
+    connect(popup, &QDialog::finished, this, [this, popup, stop] {
+        completionPopup_ = nullptr;
+        if (popup->clickedButton() == stop) {
+            stopSimulation();
+            return;
+        }
+        completionTimer_.start();
     });
     popup->open();
 }
@@ -603,6 +718,13 @@ void MainWindow::showNextCompletion()
 void MainWindow::updateRuntimeControls()
 {
     const auto state = pump_.state();
+    stopAction_->setEnabled(runtime_ != nullptr);
+    const bool editing = !runtime_ && state == RuntimePump::State::Edit;
+    importAction_->setEnabled(editing);
+    exportAction_->setEnabled(editing);
+    addSwarmAction_->setEnabled(editing);
+    addPeerAction_->setEnabled(editing && swarmSelector_->currentIndex() >= 0
+        && !canvas_->isPlacingPeer());
     settingsAction_->setEnabled(!runtime_ && state == RuntimePump::State::Edit);
     playAction_->setEnabled(state != RuntimePump::State::Running && !presentingCompletions_ && !canvas_->isPlacingPeer());
     playAction_->setText(state == RuntimePump::State::Paused ? tr("Resume") : tr("Play"));

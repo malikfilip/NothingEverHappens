@@ -20,8 +20,7 @@ Bandwidth inputs use whole KiB/s, MiB/s, or GiB/s with exact byte/s storage.
 Play validates all swarms and creates one engine runtime session, with real initial
 joins queued at t=0. A Qt timer executes one engine step per callback. Pause and
 Resume preserve the session; editing remains locked in both runtime states. The
-Event Log shows the newest 2,000 real event notifications. Next Event steps once while paused. Stop remains
-unimplemented. See [RUNTIME.md](RUNTIME.md) for bridge ownership,
+Event Log shows the newest 2,000 real event notifications. Next Event steps once while paused. Stop preserves completed pieces and membership, destroys the runtime, and returns to EDIT at time zero. See [RUNTIME.md](RUNTIME.md) for bridge ownership,
 identity, piece generation, link defaults and limitations.
 
 Configure with a Qt 6 Widgets kit matching your compiler:
@@ -38,3 +37,7 @@ Requesting the GUI without Qt 6 Widgets produces a required-package CMake error.
 
 The tracker image is embedded through resources.qrc. File selection reads only
 file metadata; it does not read or hash contents. Scenario state is held in memory.
+
+Import and Export beside Settings load/save versioned JSON .pt projects in EDIT.
+They preserve exact ownership, membership, settings, metadata and positions, not
+a running session. See [SCENARIO_FORMAT.md](SCENARIO_FORMAT.md) for the schema.

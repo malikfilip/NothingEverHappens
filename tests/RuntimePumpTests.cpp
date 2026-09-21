@@ -109,6 +109,44 @@ void continuousPlaybackAndSingleStep() {
     pump.nextEvent();
     check(executed == 3 && observations == 3 && pump.state() == RuntimePump::State::Paused);
 }
+void stopAndRestart() {
+    for (bool paused : {false, true}) {
+        RuntimePump pump;
+        auto old = std::make_unique<simulator::Simulation>();
+        int oldEvents = 0, freshEvents = 0;
+        old->schedule(std::make_unique<Action>(100, [&] { ++oldEvents; }));
+        pump.start(*old);
+        settle();
+        if (paused) pump.pause();
+        pump.stop();
+        old.reset(); // Pump timers must never dereference this destroyed session.
+        check(pump.state() == RuntimePump::State::Edit && pump.playbackTime() == 0);
+        settle();
+        pump.resume();
+        pump.nextEvent();
+        pump.stop(); // No active session: idempotent.
+        check(oldEvents == 0 && pump.state() == RuntimePump::State::Edit);
+
+        simulator::Simulation fresh;
+        fresh.schedule(std::make_unique<Action>(0, [&] { ++freshEvents; }));
+        pump.start(fresh);
+        settle();
+        check(freshEvents == 1 && oldEvents == 0 && fresh.currentTime() == 0);
+        pump.stop();
+    }
+    // A queued Max callback is canceled too, before it can consume an event.
+    RuntimePump pump;
+    auto old = std::make_unique<simulator::Simulation>();
+    int events = 0;
+    old->schedule(std::make_unique<Action>(0, [&] { ++events; }));
+    pump.setPlaybackSpeed(0);
+    pump.start(*old);
+    pump.stop();
+    old.reset();
+    settle();
+    check(events == 0 && pump.playbackTime() == 0);
+}
+
 void delayedPump() {
     simulator::Simulation simulation;
     RuntimePump pump;
@@ -292,6 +330,7 @@ int main(int argc, char** argv) {
     try {
         pacingCalculations();
         continuousPlaybackAndSingleStep();
+        stopAndRestart();
         delayedPump();
         completionAppearanceState();
         recurringPauseResume();

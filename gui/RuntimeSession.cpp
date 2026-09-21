@@ -30,7 +30,7 @@ std::array<std::uint8_t, 20> simulationIdentity(quint64 id, bool peer)
 
 }
 
-PlayPreflight RuntimeSession::preflight(const std::vector<ScenarioSwarm>& scenario)
+PlayPreflight RuntimeSession::preflight(const std::vector<ScenarioSwarm>& scenario, bool forPlayback)
 {
     PlayPreflight result;
     std::set<quint64> swarmIds, peerIds;
@@ -43,7 +43,7 @@ PlayPreflight RuntimeSession::preflight(const std::vector<ScenarioSwarm>& scenar
             [](const ScenarioPeer& peer) { return peer.initiallyJoined; });
         if (!joined) {
             result.skippedSwarms << swarm.name;
-            continue;
+            if (forPlayback) continue;
         }
         result.participatingSwarms.push_back(swarm.id);
         if (joined == 1) result.singlePeerSwarms << swarm.name;
@@ -88,7 +88,7 @@ PlayPreflight RuntimeSession::preflight(const std::vector<ScenarioSwarm>& scenar
             }
         }
     }
-    if (result.participatingSwarms.empty())
+    if (forPlayback && result.participatingSwarms.empty())
         result.errors << QStringLiteral("At least one swarm must contain an initially joined peer.");
     if (result.participatingSwarms.size() > maxEngineValue || peerCount > maxEngineValue)
         result.errors << QStringLiteral("Too many swarms or peers for engine IDs.");
@@ -158,4 +158,30 @@ RuntimeSession::RuntimeSession(std::vector<ScenarioSwarm>& scenario, const QRect
         network_->joinSwarm(binding.swarmId, binding.peerId, std::move(options));
     }
     // No step()/run(): STARTED events intentionally remain queued at t=0.
+}
+
+void RuntimeSession::snapshotToScenario(std::vector<ScenarioSwarm>& scenario) const
+{
+    // Allocate/copy before publishing so a failed snapshot leaves the editor intact.
+    auto snapshot = scenario;
+    for (auto& swarm : snapshot) for (auto& peer : swarm.peers) {
+        const auto found = peerBindings_.find(peer.id);
+        if (found == peerBindings_.end() || found->second.scenarioSwarmId != swarm.id)
+            continue; // Skipped swarms never entered this session.
+        const auto& binding = found->second;
+        const auto& enginePeer = network_->peer(binding.peerId);
+        peer.initiallyJoined = enginePeer.isActiveInSwarm(binding.swarmId);
+        // Saved inactive memberships retain ownership too. Never-joined peers use
+        // their frozen initial inventory. receivedBlocks deliberately is NOT copied.
+        peer.initialBitfield = enginePeer.hasSwarm(binding.swarmId)
+            ? enginePeer.swarmState(binding.swarmId).localBitfield : binding.initialBitfield;
+        peer.initialPieceCount = 0;
+        for (const auto byte : *peer.initialBitfield)
+            peer.initialPieceCount += std::popcount(byte);
+        // These existing editor fields are derived from the exact bitmap, never
+        // used to reconstruct it or to persist a separate runtime role.
+        peer.initialRole = peer.initialPieceCount == swarm.pieceCount
+            ? ScenarioPeer::Role::Seeder : ScenarioPeer::Role::Leecher;
+    }
+    scenario.swap(snapshot);
 }

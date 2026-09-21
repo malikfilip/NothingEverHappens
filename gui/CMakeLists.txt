@@ -30,6 +30,7 @@ set_target_properties(picoTorrent_gui PROPERTIES
 
 target_sources(picotorrent_runtime PRIVATE
     RuntimeSession.hpp RuntimeSession.cpp RuntimePump.hpp PlaybackClock.hpp
+    ScenarioPersistence.hpp ScenarioPersistence.cpp
     ScenarioPieces.hpp ScenarioPieces.cpp PeerInspection.hpp PeerInspection.cpp
     ../src/Simulation.cpp ../src/Peer.cpp ../src/Link.cpp ../src/Message.cpp
     ../src/Swarm.cpp ../src/Network.cpp ../src/Tracker.cpp
@@ -46,4 +47,7 @@ if(BUILD_TESTING)
     add_executable(runtime_pump_tests ../tests/RuntimePumpTests.cpp)
     target_link_libraries(runtime_pump_tests PRIVATE picotorrent_runtime)
     add_test(NAME runtime_pump COMMAND runtime_pump_tests)
+    add_executable(scenario_persistence_tests ../tests/ScenarioPersistenceTests.cpp)
+    target_link_libraries(scenario_persistence_tests PRIVATE picotorrent_runtime)
+    add_test(NAME scenario_persistence COMMAND scenario_persistence_tests)
 endif()

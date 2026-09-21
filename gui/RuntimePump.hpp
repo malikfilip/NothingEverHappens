@@ -53,6 +53,18 @@ public:
         pacing_.reset(simulation.currentTime(), now());
         resume();
     }
+    // Detach before the owner destroys Simulation. Safe to call again in EDIT.
+    void stop() {
+        timer_.stop();
+        displayTimer_.stop();
+        pacing_.pause(now());
+        pacing_.reset(0, now());
+        simulation_ = nullptr;
+        callbacks_ = 0;
+        state_ = State::Edit;
+        if (stateChanged) stateChanged();
+        if (playbackChanged) playbackChanged();
+    }
     void resume() {
         if (!simulation_ || state_ == State::Running) return;
         pacing_.resume(now());
