@@ -162,7 +162,11 @@ void Network::leaveSwarm(SwarmId swarmId, PeerId local) {
         std::set<PeerId> remotes;
         for (const auto& [remote, connection] : p.swarmState(swarmId).connections) remotes.insert(remote);
         for (const auto remote : remotes) tryScheduleRequests(p, swarmId, remote);
-        if (p.swarmState(swarmId).choking.managed) updateChoking(survivor, swarmId);
+        if (p.swarmState(swarmId).choking.managed) {
+            // Departure may repair a missing optimistic assignment, never refill regular slots.
+            repairOptimistic(survivor, swarmId);
+            ensureChokingClock(survivor, swarmId);
+        }
     }
 }
 }

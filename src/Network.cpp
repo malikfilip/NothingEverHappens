@@ -23,7 +23,7 @@ namespace simulator {
     }
 
     Network::Network(Simulation& simulation, std::vector<Peer> peers, std::vector<Link> links, std::vector<Swarm> swarms, std::size_t trackerMaximum, double trackerInterval, BitTorrentSettings settings)
-        : bitTorrentSettings_(settings), tracker_(trackerMaximum, simulation.seed(), trackerInterval), simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
+        : bitTorrentSettings_(settings), tracker_(trackerMaximum, simulation.seed(), trackerInterval), optimisticRng_(simulation.seed()), simulation_(simulation), peers_(std::move(peers)), links_(std::move(links)), swarms_(std::move(swarms))
     {
         if (const auto* error = settings.validationError()) throw std::invalid_argument(error);
         for (std::size_t i = 0; i < peers_.size(); ++i) {
@@ -70,12 +70,15 @@ namespace simulator {
             || message.type() == MessageType::NotInterested;
 
         bool wasInterested = false;
+        bool remoteWasInterested = false;
+        bool wasChoked = true;
         if ((availability || interestMessage) && to->hasSwarm(swarmId)) {
             const auto& connections = to->swarmState(swarmId).connections;
             const auto connection = connections.find(sender);
             if (connection != connections.end()) {
                 wasInterested = connection->second.weAreInterestedInRemote;
-
+                remoteWasInterested = connection->second.remoteInterestedInUs;
+                wasChoked = connection->second.weAreChokingRemote;
             }
         }
         // A normal request can cross a policy CHOKE in flight. Drop that obsolete
@@ -201,13 +204,8 @@ namespace simulator {
                 }
             }
         }
-        if (interestMessage) updateChoking(receiver, swarmId);
-        if (availability && to->swarmState(swarmId).choking.managed) updateChoking(receiver, swarmId);
-        if (message.type() == MessageType::Piece) {
-            // Completion can suspend an upload cycle or make a managed peer useful.
-            for (const auto local : {sender, receiver})
-                if (peer(local).swarmState(swarmId).choking.managed) updateChoking(local, swarmId);
-        }
+        if (interestMessage)
+            observeInterest(receiver, swarmId, sender, remoteWasInterested, wasChoked);
         if (availability) {
             const bool interested = to->swarmState(swarmId).connections.at(sender).weAreInterestedInRemote;
             if (interested != wasInterested) {

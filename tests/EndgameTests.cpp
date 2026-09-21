@@ -171,10 +171,10 @@ void firstWins(bool requestStillInFlight, bool queued, unsigned blockSize = 1638
     check(f.download(3).scheduledRequests == std::vector<RequestPayload>{block});
     f.sim.run();
     check(cancels == 1 && haves == 2 && providers.size() == 2 && completions == 1);
-    // Reactive NOT_INTERESTED handling may purge a still-queued losing PIECE.
-    // Active/propagating losers must retain the original late-arrival semantics.
-    check(pieces == (queued ? 1u : 2u));
-    check(checkedLate == !queued && checkedRequestBeforeCancel);
+    // NOT_INTERESTED can retain an optimistic unchoke. Even a committed queued
+    // loser now arrives late; it must not earn useful credit or complete twice.
+    check(pieces == 2);
+    check(checkedLate && checkedRequestBeforeCancel);
     check(f.state().receivedBlocks.at(0) == std::vector<BlockRange>{{0, blockSize}});
     f.drained();
     rejects([&] { f.net.deliver(1, 3, 2, Message(MessageType::Piece, PiecePayload{0, 0, blockSize})); });

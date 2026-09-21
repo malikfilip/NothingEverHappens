@@ -1779,9 +1779,21 @@ void initialLocalBitfield()
     rejects([&] { peer.joinSwarm(swarm, {0, 0}); });
     check(peer.swarmState(1).localBitfield == std::vector<std::uint8_t>({0x80, 0x80}));
 }
+// Isolate the timed 2 -> 1 direction from bootstrap traffic to the third peer.
+// Policy selection itself is exercised by ChokingTests; this fixture starts with
+// a settled uninterested optimistic unchoke on 2 -> 3.
+void presetOptimistic(InterestFixture& f)
+{
+    auto& state = const_cast<PeerSwarmState&>(f.network.peer(2).swarmState(1));
+    state.choking.optimistic = state.choking.optimisticCursor = 3;
+    state.connections.at(3).weAreChokingRemote = false;
+    const_cast<PeerSwarmState&>(f.network.peer(3).swarmState(1))
+        .connections.at(2).remoteIsChokingUs = false;
+}
 void chokePolicyAndArrival()
 {
     InterestFixture f;
+    presetOptimistic(f);
     check(PeerConnectionState{}.weAreChokingRemote && PeerConnectionState{}.remoteIsChokingUs);
     f.receive(Message(MessageType::NotInterested));
     f.simulation.run(); check(f.events.empty());
@@ -1798,7 +1810,10 @@ void chokePolicyAndArrival()
     f.simulation.schedule(std::make_unique<CheckEvent>(12, [&] {
         f.receive(Message(MessageType::NotInterested));
         f.receive(Message(MessageType::NotInterested));
-        check(f.local().weAreChokingRemote); // Reactively releases the vacant assignment.
+        check(!f.local().weAreChokingRemote); // NOT_INTERESTED is observation only.
+        // Exercise CHOKE transport explicitly; count-only fixtures have no periodic decisions.
+        const_cast<PeerConnectionState&>(f.local()).weAreChokingRemote = true;
+        f.simulation.schedule(std::make_unique<SendMessageEvent>(12, f.network, 1, 2, 1, Message(MessageType::Choke)));
     }));
     f.simulation.schedule(std::make_unique<CheckEvent>(12.081, [&] {
         check(f.local().weAreChokingRemote);
@@ -1816,7 +1831,8 @@ void chokePolicyScope()
     f.receive(Message(MessageType::Interested));
     f.simulation.run();
     check(!f.local().weAreChokingRemote && f.local().remoteIsChokingUs);
-    check(f.local(2).weAreChokingRemote && f.local(1, 3).weAreChokingRemote);
+    check(f.local(2).weAreChokingRemote); // Other swarm remains untouched.
+    check(!f.local(1, 3).weAreChokingRemote); // Uninterested optimistic peer in this swarm.
     check(f.network.peer(1).swarmState(1).connections.at(2).weAreChokingRemote);
     f.receive(Message(MessageType::Interested), 2);
     f.receive(Message(MessageType::Interested), 1, 3);
@@ -1826,17 +1842,18 @@ void chokePolicyScope()
     check(!f.local(2).weAreChokingRemote && !f.local(1, 3).weAreChokingRemote);
     f.receive(Message(MessageType::NotInterested));
     f.simulation.run();
-    check(f.local().weAreChokingRemote && !f.local().remoteIsChokingUs);
+    check(!f.local().weAreChokingRemote && !f.local().remoteIsChokingUs);
     check(!f.local(2).weAreChokingRemote && !f.local(1, 3).weAreChokingRemote);
     check(f.requests(MessageType::Unchoke) == 1);
     check(f.requests(MessageType::Unchoke, 2) == 1);
     check(f.requests(MessageType::Unchoke, 1, 3) == 1);
-    check(f.requests(MessageType::Choke) == 1);
+    check(f.requests(MessageType::Choke) == 0);
 }
 
 void chokePolicyUsesFifo()
 {
     InterestFixture f;
+    presetOptimistic(f);
     occupyDirection(f.network, 1, 2, 1);
     f.receive(Message(MessageType::Interested));
     f.simulation.schedule(std::make_unique<CheckEvent>(0.001, [&] {
@@ -1844,7 +1861,12 @@ void chokePolicyUsesFifo()
         check(f.network.peer(1).swarmState(1).connections.at(2).remoteIsChokingUs);
     }));
     f.simulation.schedule(std::make_unique<CheckEvent>(11, [&] { occupyDirection(f.network, 1, 2, 1); }));
-    f.simulation.schedule(std::make_unique<CheckEvent>(12, [&] { f.receive(Message(MessageType::NotInterested)); }));
+    f.simulation.schedule(std::make_unique<CheckEvent>(12, [&] {
+        f.receive(Message(MessageType::NotInterested));
+        check(!f.local().weAreChokingRemote);
+        const_cast<PeerConnectionState&>(f.local()).weAreChokingRemote = true;
+        f.simulation.schedule(std::make_unique<SendMessageEvent>(12, f.network, 1, 2, 1, Message(MessageType::Choke)));
+    }));
     f.simulation.run();
     checkEventTimes(f.events, 2, MessageType::Unchoke, 0, 2.176, 2.256, 2.356);
     checkEventTimes(f.events, 2, MessageType::Choke, 12, 13.176, 13.256, 13.356);
@@ -2039,8 +2061,11 @@ void requestArrivalRevalidation()
     {
         RequestFixture f;
         f.network.send(1, 2, 1, Message(MessageType::Request, RequestPayload{0, 0, 16}));
-        // A managed reactive CHOKE crossing REQUEST releases the obsolete request.
-        f.network.deliver(1, 2, 1, Message(MessageType::NotInterested));
+        // Model a local managed CHOKE while REQUEST is in flight. NOT_INTERESTED
+        // alone no longer guarantees CHOKE (an optimistic peer can stay unchoked).
+        auto& provider = const_cast<PeerSwarmState&>(f.network.peer(1).swarmState(1));
+        provider.choking.managed = true;
+        provider.connections.at(2).weAreChokingRemote = true;
         check(f.incoming().weAreChokingRemote);
         f.simulation.run();
         check(f.incoming().acceptedRequests.empty() && f.outgoing().outgoingRequests.empty());
@@ -2790,11 +2815,11 @@ void schedulerReplansWithdrawnAvailability()
     check(requests.size() == 7);
     check(std::all_of(requests.begin(), requests.end(), [](const auto& block) { return block.index == 1; }));
     check(f.network.peer(2).swarmState(1).localBitfield[0] == 0x40);
-    // Finishing the advertised piece sent NOT_INTERESTED and caused CHOKE.
-    // New availability must restore interest, then wait for UNCHOKE before requesting.
-    check(!f.connection().weAreInterestedInRemote && f.connection().remoteIsChokingUs);
+    // Finishing the advertised piece sends NOT_INTERESTED, but an optimistic
+    // or qualifying regular pre-unchoke can remain available for the next HAVE.
+    check(!f.connection().weAreInterestedInRemote && !f.connection().remoteIsChokingUs);
     f.network.deliver(1, 1, 2, Message(MessageType::Have, HavePayload{0}));
-    check(f.connection().weAreInterestedInRemote && f.connection().scheduledRequests.empty());
+    check(f.connection().weAreInterestedInRemote && f.connection().scheduledRequests.size() == 5);
     f.simulation.run();
     check(f.network.peer(2).swarmState(1).localBitfield[0] == 0xc0);
 }

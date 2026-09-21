@@ -46,6 +46,10 @@ namespace simulator {
         double recentDownloadRate = 0;
         double recentUploadRate = 0;
 
+        // New-connection preference lasts through the first eligible optimistic draw.
+        // Connection removal/recreation naturally resets this opportunity.
+        bool optimisticConsidered = false;
+
         bool handshakeComplete() const { return handshakeSent && handshakeReceived; }
     };
 
@@ -58,7 +62,7 @@ namespace simulator {
     struct ChokingState {
         bool eventPending = false;
         bool managed = false;
-        bool cycleActive = false;
+        bool cycleActive = false; // Clock initialized; idle cycles may have no pending wake-up.
         std::uint64_t cycleGeneration = 0;
         double cycleStart = 0;
         double windowStart = 0;
@@ -66,9 +70,11 @@ namespace simulator {
         double nextRegularDeadline = 0;
         double nextOptimisticDeadline = 0;
         std::optional<double> pendingWakeup;
+        // Regular unchokes, including qualifying uninterested peers. The four-slot
+        // budget counts interested peers across this set and optimistic together.
         std::set<PeerId> preferred;
         std::optional<PeerId> optimistic;
-        std::optional<PeerId> optimisticCursor;
+        std::optional<PeerId> optimisticCursor; // Last selection, retained for inspection; not an ID cursor.
     };
 
     struct PeerSwarmState {

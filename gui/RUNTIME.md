@@ -169,9 +169,46 @@ with millisecond precision and commits only on valid OK. Cancel discards edits.
 RuntimeSession validates and stores an immutable copy at creation. Settings are
 disabled whenever a session exists, including pause/error states. Stop restores Settings in EDIT. The shared engine BitTorrentSettings type reaches Network through
 RuntimeSession and controls bootstrap plus peer/swarm-local choking deadlines.
-For regular=5, first actionable interest at T immediately fills available upload
-slots, with full preferred decisions at T+5, T+10, T+15. Optimistic timing is
+For regular=5, first actionable interest at T performs one startup assignment
+using observations available then. Later arrivals wait for full preferred decisions
+at T+5, T+10, T+15. Optimistic timing is
 independent (for example 5/25). Simulation has no BitTorrent-specific fields.
+
+The upload budget counts at most four interested unchoked peers. An uninterested
+optimistic peer does not consume a slot; qualifying high-rate uninterested regular
+peers can also stay unchoked. Only an already-unchoked peer becoming interested
+can trigger an immediate budget correction: choke the worst regular incumbent(s)
+as necessary, preserving the optimistic assignment. NOT_INTERESTED never itself
+chokes or refills regular slots. HAVE, BITFIELD and PIECE do not select assignments.
+Optimistic-only deadlines rotate outside the existing regular set; they may reduce
+that set to enforce the budget but never refill it. Missing optimistic assignments
+can be repaired at startup, regular promotion or departure.
+
+Observation updates never restart periodic deadlines or clear rate history. Idle
+wake-ups are omitted so completed simulations can drain; resuming activity keeps
+the original phase and ages byte buckets through elapsed regular boundaries
+without running skipped assignment decisions. Runtime wire colors continue to use
+sender choke state and the explicit optimistic assignment; blue does not imply
+payload transfer.
+
+Optimistic choices use a separate mt19937_64 stream initialized from the Simulation
+seed, following the tracker's existing seeded RNG/rejection-sampling approach
+without consuming tracker draws. Established, active, non-preferred connections
+are eligible regardless of interest or seed status. The incumbent is excluded when
+alternatives exist; a sole candidate can remain assigned. IDs only establish stable
+enumeration for replay, never priority. Each connection receives weight 3 on its
+first eligible lottery and weight 1 thereafter, win or lose. Leaving/reconnecting
+resets that opportunity. Ordinary messages do not consume draws or renew it.
+
+BEP 3 specifies a threefold preference for new connections and a 30-second default
+rotation, but not a complete sampling procedure or the lifetime of newness. Cohen's
+paper section 3.3 describes the same default cadence and rate-independent trial;
+neither description mandates seed exclusion or a separate optimistic rule for
+seeders. The weighted lottery, first-opportunity lifetime and exclusion of an
+incumbent when alternatives exist are explicit simulator policy choices. One-time
+bootstrap and omission of idle decisions remain existing approximations.
+References: https://www.bittorrent.org/beps/bep_0003.html#peer-messages and
+https://www.bittorrent.org/bittorrentecon.pdf (sections 3.3 and 3.5).
 
 ## Continuous playback display
 

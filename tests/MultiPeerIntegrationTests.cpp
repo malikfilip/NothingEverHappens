@@ -280,8 +280,14 @@ void autonomousFourPeerRing(bool tracing)
             require(connection.scheduledRequests.empty() && connection.outgoingRequests.empty() && connection.acceptedRequests.empty()
                 && connection.retiredRequests.empty() && connection.committedRequests.empty(),
                 "Requests remain after swarm completion");
-            require(!connection.weAreInterestedInRemote && !connection.remoteInterestedInUs
-                && connection.weAreChokingRemote && connection.remoteIsChokingUs, "Final interest/choke state is inconsistent");
+            require(!connection.weAreInterestedInRemote && !connection.remoteInterestedInUs,
+                "Final interest state is inconsistent");
+            const auto& opposite = network.peer(remote).swarmState(1).connections.at(id);
+            require(connection.weAreChokingRemote == opposite.remoteIsChokingUs
+                && connection.remoteIsChokingUs == opposite.weAreChokingRemote,
+                "Final directional choke notifications disagree");
+            require(!connection.weAreChokingRemote == (state.choking.preferred.contains(remote)
+                || state.choking.optimistic == remote), "Final choke policy assignment disagrees");
             const auto& direction = directions[id][remote];
             require(direction.queued.empty() && !direction.active && direction.arrivals.empty(), "Transport did not drain");
             require(direction.starts == direction.completions && direction.starts == direction.delivered, "Transport event counts differ");

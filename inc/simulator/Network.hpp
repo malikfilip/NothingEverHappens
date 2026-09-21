@@ -5,6 +5,7 @@
 #include <optional>
 #include <map>
 #include <set>
+#include <random>
 
 #include "simulator/Link.hpp"
 #include "simulator/Message.hpp"
@@ -127,14 +128,17 @@ namespace simulator {
         void scheduleTrackerAnnounce(SwarmId swarmId, PeerId peer, AnnounceKind kind, double time);
         void scheduleRechoke(PeerId local, SwarmId swarmId);
         void rechoke(PeerId local, SwarmId swarmId, std::uint64_t cycle, double deadline);
-        void updateChoking(PeerId local, SwarmId swarmId);
-        std::vector<PeerId> rankedInterested(PeerId local, SwarmId swarmId) const;
+        void ensureChokingClock(PeerId local, SwarmId swarmId);
+        void observeInterest(PeerId local, SwarmId swarmId, PeerId remote, bool wasInterested, bool wasChoked);
+        void enforceInterestedBudget(PeerId local, SwarmId swarmId);
+        void repairOptimistic(PeerId local, SwarmId swarmId, bool rotate = false);
+        std::vector<PeerId> rankedInterested(PeerId local, SwarmId swarmId, bool interestedOnly = true) const;
         void fillChokingSlots(PeerId local, SwarmId swarmId, bool rotateOptimistic = false);
         void applyChoking(PeerId local, SwarmId swarmId);
         bool hasUsefulExchange(PeerId local, SwarmId swarmId) const;
         static bool ownsAll(const Swarm& swarm, const PeerSwarmState& state);
-        static std::optional<PeerId> selectOptimistic(std::vector<PeerId> eligible,
-                                                    std::optional<PeerId> previous);
+        std::optional<PeerId> selectOptimistic(PeerId local, SwarmId swarmId,
+            std::vector<PeerId> eligible, std::optional<PeerId> previous);
         void setChoking(PeerId local, SwarmId swarmId, PeerId remote, bool choke);
         void recordUsefulPiece(PeerId sender, PeerId receiver, SwarmId swarmId, std::uint64_t bytes);
 
@@ -184,6 +188,8 @@ namespace simulator {
         LinkConfigProvider link_config_provider_;
         const BitTorrentSettings bitTorrentSettings_;
         Tracker tracker_;
+        // Independent simulation-seeded stream: choking draws never perturb tracker draws.
+        std::mt19937_64 optimisticRng_;
         std::map<std::pair<PeerId, SwarmId>, DiscoveryState> discovery_;
         Simulation& simulation_;
         std::vector<Peer> peers_;

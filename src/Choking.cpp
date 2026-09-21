@@ -10,7 +10,7 @@
 
 namespace simulator {
 namespace {
-constexpr std::size_t preferredSlots = 3;
+constexpr std::size_t interestedSlots = 4;
 
 double nextDeadline(double previous, double interval)
 {
@@ -20,14 +20,32 @@ double nextDeadline(double previous, double interval)
     return next;
 }
 
-void resetMeasurements(PeerSwarmState& state)
+void measureRates(PeerSwarmState& state, double deadline, double interval)
 {
-    state.choking.previousIntervalMeasured = false;
+    auto& policy = state.choking;
     for (auto& [id, connection] : state.connections) {
+        const double divisor = policy.previousIntervalMeasured ? 2.0 : 1.0;
+        connection.recentDownloadRate =
+            (static_cast<double>(connection.downloadedPreviousInterval) + connection.downloadedInWindow) / interval / divisor;
+        connection.recentUploadRate =
+            (static_cast<double>(connection.uploadedPreviousInterval) + connection.uploadedInWindow) / interval / divisor;
+        connection.downloadedPreviousInterval = connection.downloadedInWindow;
+        connection.uploadedPreviousInterval = connection.uploadedInWindow;
         connection.downloadedInWindow = connection.uploadedInWindow = 0;
-        connection.downloadedPreviousInterval = connection.uploadedPreviousInterval = 0;
-        connection.recentDownloadRate = connection.recentUploadRate = 0;
     }
+    policy.previousIntervalMeasured = true;
+    policy.windowStart = deadline;
+}
+
+// Skip idle wake-ups without moving the original periodic phase. A deadline at
+// exactly now is still executed normally, respecting equal-time event ordering.
+double skipIdleDeadlines(double deadline, double interval, double now)
+{
+    if (deadline >= now) return deadline;
+    const double next = deadline + std::ceil((now - deadline) / interval) * interval;
+    if (!std::isfinite(next) || next < now || next <= deadline)
+        throw std::invalid_argument("Choking interval cannot advance simulation time");
+    return next;
 }
 }
 bool Network::ownsAll(const Swarm& currentSwarm, const PeerSwarmState& state)
@@ -53,17 +71,40 @@ bool Network::hasUsefulExchange(PeerId local, SwarmId swarmId) const
     return false;
 }
 
-std::optional<PeerId> Network::selectOptimistic(std::vector<PeerId> eligible,
-                                             std::optional<PeerId> previous)
+std::optional<PeerId> Network::selectOptimistic(PeerId local, SwarmId swarmId,
+    std::vector<PeerId> eligible, std::optional<PeerId> previous)
 {
-    // Extension point for a future seeded, weighted sampler.
     if (eligible.empty()) return std::nullopt;
+    // Canonical enumeration makes replay independent of unordered-map/rate order;
+    // IDs do not confer priority. Rotate away from the incumbent when possible.
     std::sort(eligible.begin(), eligible.end());
-    if (previous) {
-        const auto next = std::upper_bound(eligible.begin(), eligible.end(), *previous);
-        if (next != eligible.end()) return *next;
+    if (eligible.size() > 1 && previous) std::erase(eligible, *previous);
+    auto& connections = peers_[peer_transport_.at(local).peerIndex].swarm_states_.at(swarmId).connections;
+    std::uint64_t totalWeight = 0;
+    for (const auto remote : eligible)
+        totalWeight += connections.at(remote).optimisticConsidered ? 1 : 3;
+
+    // BEP 3 gives new connections a threefold preference, but does not define
+    // its lifetime. Here it applies to their first eligible lottery, win or lose.
+    // Use the same fixed engine/rejection mapping as Tracker for portable replay.
+    std::uint64_t ticket = 0;
+    if (eligible.size() > 1) {
+        const auto threshold = (std::uint64_t{0} - totalWeight) % totalWeight;
+        std::uint64_t draw;
+        do { draw = optimisticRng_(); } while (draw < threshold);
+        ticket = draw % totalWeight;
     }
-    return eligible.front();
+    std::optional<PeerId> selected;
+    for (const auto remote : eligible) {
+        auto& connection = connections.at(remote);
+        const std::uint64_t weight = connection.optimisticConsidered ? 1 : 3;
+        if (!selected) {
+            if (ticket < weight) selected = remote;
+            else ticket -= weight;
+        }
+        connection.optimisticConsidered = true;
+    }
+    return selected;
 }
 
 void Network::setChoking(PeerId local, SwarmId swarmId, PeerId remote, bool choke)
@@ -92,13 +133,13 @@ void Network::setChoking(PeerId local, SwarmId swarmId, PeerId remote, bool chok
         swarmId, local, remote, Message(choke ? MessageType::Choke : MessageType::Unchoke)));
 }
 
-std::vector<PeerId> Network::rankedInterested(PeerId local, SwarmId swarmId) const
+std::vector<PeerId> Network::rankedInterested(PeerId local, SwarmId swarmId, bool interestedOnly) const
 {
     const auto& state = peer(local).swarmState(swarmId);
     const bool seed = ownsAll(swarm(swarmId), state);
     std::vector<PeerId> interested;
     for (const auto& [remote, connection] : state.connections)
-        if (connection.handshakeComplete() && connection.remoteInterestedInUs
+        if (connection.handshakeComplete() && (!interestedOnly || connection.remoteInterestedInUs)
             && peer(remote).isActiveInSwarm(swarmId)) interested.push_back(remote);
     std::sort(interested.begin(), interested.end(), [&](PeerId a, PeerId b) {
         const auto& ca = state.connections.at(a);
@@ -112,28 +153,58 @@ std::vector<PeerId> Network::rankedInterested(PeerId local, SwarmId swarmId) con
 
 void Network::fillChokingSlots(PeerId local, SwarmId swarmId, bool rotateOptimistic)
 {
+    const auto& state = peer(local).swarmState(swarmId);
     auto& policy = peers_[peer_transport_.at(local).peerIndex].swarm_states_.at(swarmId).choking;
-    const auto interested = rankedInterested(local, swarmId);
-    auto eligible = [&](PeerId id) {
-        return std::find(interested.begin(), interested.end(), id) != interested.end();
+    const auto ranked = rankedInterested(local, swarmId, false);
+    const bool seed = ownsAll(swarm(swarmId), state);
+    const auto rate = [&](PeerId id) {
+        const auto& connection = state.connections.at(id);
+        return seed ? connection.recentUploadRate : connection.recentDownloadRate;
+    };
+    const auto interested = [&](PeerId id) { return state.connections.at(id).remoteInterestedInUs; };
+    const auto eligible = [&](PeerId id) {
+        return std::find(ranked.begin(), ranked.end(), id) != ranked.end();
     };
     std::erase_if(policy.preferred, [&](PeerId id) { return !eligible(id); });
+    // A regular decision can promote the optimistic peer without a wire transition.
     if (policy.optimistic && (!eligible(*policy.optimistic) || policy.preferred.contains(*policy.optimistic)))
         policy.optimistic.reset();
 
-    // Fill vacancies, never displace valid incumbents between regular decisions.
-    for (const auto remote : interested) {
-        if (policy.preferred.size() == preferredSlots) break;
-        policy.preferred.insert(remote);
-    }
-    if (policy.optimistic && policy.preferred.contains(*policy.optimistic)) policy.optimistic.reset();
+    const auto selectRegular = [&](std::size_t capacity) {
+        std::set<PeerId> selected;
+        // Complete the regular decision (also used once at startup).
+        for (const bool incumbents : {true, false}) {
+            for (const auto remote : ranked) {
+                if (selected.size() == capacity) break;
+                if (policy.optimistic == remote || !interested(remote)
+                    || policy.preferred.contains(remote) != incumbents) continue;
+                selected.insert(remote);
+            }
+        }
+        // Uninterested peers above the rate cutoff are pre-unchoked without using
+        // an interested slot. With vacancies, any positive measured rate qualifies.
+        double cutoff = 0;
+        if (selected.size() == capacity) {
+            cutoff = std::numeric_limits<double>::infinity();
+            for (const auto remote : selected) cutoff = std::min(cutoff, rate(remote));
+        }
+        for (const auto remote : ranked)
+            if (policy.optimistic != remote && !interested(remote) && rate(remote) > cutoff)
+                selected.insert(remote);
+        policy.preferred = std::move(selected);
+    };
+
     if (rotateOptimistic || !policy.optimistic) {
+        // Reserve room for a potentially interested optimistic selection. An
+        // uninterested selection gives that fourth interested slot back below.
+        selectRegular(interestedSlots - 1);
         std::vector<PeerId> candidates;
-        for (const auto remote : interested)
+        for (const auto remote : ranked)
             if (!policy.preferred.contains(remote)) candidates.push_back(remote);
-        policy.optimistic = selectOptimistic(std::move(candidates), policy.optimisticCursor);
+        policy.optimistic = selectOptimistic(local, swarmId, std::move(candidates), policy.optimistic);
         if (policy.optimistic) policy.optimisticCursor = policy.optimistic;
     }
+    selectRegular(interestedSlots - (policy.optimistic && interested(*policy.optimistic) ? 1 : 0));
 }
 
 void Network::applyChoking(PeerId local, SwarmId swarmId)
@@ -161,15 +232,16 @@ void Network::scheduleRechoke(PeerId local, SwarmId swarmId)
     policy.eventPending = true;
 }
 
-void Network::updateChoking(PeerId local, SwarmId swarmId)
+void Network::ensureChokingClock(PeerId local, SwarmId swarmId)
 {
-    if (!peer(local).isActiveInSwarm(swarmId)) return;
     auto& state = peers_[peer_transport_.at(local).peerIndex].swarm_states_.at(swarmId);
     auto& policy = state.choking;
-    const bool useful = hasUsefulExchange(local, swarmId);
-    if (useful && !policy.cycleActive) {
-        const double now = simulation_.currentTime();
-        const double regular = nextDeadline(now, bitTorrentSettings_.regularRechokeInterval);
+    if (!policy.managed || policy.eventPending) return;
+    const double now = simulation_.currentTime();
+    const double interval = bitTorrentSettings_.regularRechokeInterval;
+    if (!policy.cycleActive) {
+        if (!hasUsefulExchange(local, swarmId)) return;
+        const double regular = nextDeadline(now, interval);
         const double optimistic = nextDeadline(now, bitTorrentSettings_.optimisticUnchokeInterval);
         if (policy.cycleGeneration == std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("Choking cycle generation exhausted");
@@ -178,22 +250,74 @@ void Network::updateChoking(PeerId local, SwarmId swarmId)
         policy.cycleStart = policy.windowStart = now;
         policy.nextRegularDeadline = regular;
         policy.nextOptimisticDeadline = optimistic;
-        resetMeasurements(state);
-    } else if (!useful && policy.cycleActive) {
-        policy.cycleActive = false;
-        policy.eventPending = false;
-        policy.pendingWakeup.reset();
-        // Old heap events remain harmless: active state and cycle token gate them.
+    } else {
+        const double regular = skipIdleDeadlines(policy.nextRegularDeadline, interval, now);
+        const double optimistic = skipIdleDeadlines(policy.nextOptimisticDeadline,
+            bitTorrentSettings_.optimisticUnchokeInterval, now);
+        // Age the two-interval history across omitted idle boundaries. After
+        // three rolls all buckets/rates are zero; no neighborhood selection runs.
+        double boundary = policy.nextRegularDeadline;
+        for (unsigned i = 0; i < 3 && boundary < regular; ++i) {
+            measureRates(state, boundary, interval);
+            boundary = nextDeadline(boundary, interval);
+        }
+        if (regular != policy.nextRegularDeadline) policy.windowStart = regular - interval;
+        policy.nextRegularDeadline = regular;
+        policy.nextOptimisticDeadline = optimistic;
     }
-    policy.managed = true;
-    fillChokingSlots(local, swarmId);
+    if (hasUsefulExchange(local, swarmId)) scheduleRechoke(local, swarmId);
+}
+
+void Network::enforceInterestedBudget(PeerId local, SwarmId swarmId)
+{
+    auto& state = peers_[peer_transport_.at(local).peerIndex].swarm_states_.at(swarmId);
+    auto& policy = state.choking;
+    const auto ranked = rankedInterested(local, swarmId);
+    std::size_t count = 0;
+    for (const auto remote : ranked)
+        count += policy.preferred.contains(remote) || policy.optimistic == remote;
+    // Only remove the worst regular incumbents needed to restore the budget.
+    // The optimistic assignment is protected; no vacancies are filled here.
+    for (auto it = ranked.rbegin(); count > interestedSlots && it != ranked.rend(); ++it)
+        if (policy.preferred.erase(*it)) --count;
+}
+
+void Network::repairOptimistic(PeerId local, SwarmId swarmId, bool rotate)
+{
+    auto& policy = peers_[peer_transport_.at(local).peerIndex].swarm_states_.at(swarmId).choking;
+    if (policy.optimistic && !rotate) return;
+    auto candidates = rankedInterested(local, swarmId, false);
+    std::erase_if(candidates, [&](PeerId remote) { return policy.preferred.contains(remote); });
+    policy.optimistic = selectOptimistic(local, swarmId, std::move(candidates), policy.optimistic);
+    if (policy.optimistic) policy.optimisticCursor = policy.optimistic;
+    enforceInterestedBudget(local, swarmId);
     applyChoking(local, swarmId);
-    scheduleRechoke(local, swarmId);
+}
+
+void Network::observeInterest(PeerId local, SwarmId swarmId, PeerId remote,
+                              bool wasInterested, bool wasChoked)
+{
+    auto& state = peers_[peer_transport_.at(local).peerIndex].swarm_states_.at(swarmId);
+    auto& policy = state.choking;
+    const bool interested = state.connections.at(remote).remoteInterestedInUs;
+    if (!policy.managed && interested) {
+        // One startup decision per membership, not one bootstrap per arrival.
+        policy.managed = true;
+        ensureChokingClock(local, swarmId);
+        fillChokingSlots(local, swarmId);
+        applyChoking(local, swarmId);
+    } else if (policy.managed && !wasInterested && interested && !wasChoked) {
+        enforceInterestedBudget(local, swarmId);
+        applyChoking(local, swarmId);
+    }
+    // Interest may wake an idle clock, but never restart its phase/history.
+    ensureChokingClock(local, swarmId);
 }
 
 void Network::recordUsefulPiece(PeerId sender, PeerId receiver, SwarmId swarmId, std::uint64_t bytes)
 {
     for (const auto local : {sender, receiver}) {
+        ensureChokingClock(local, swarmId); // Accounting/wake-up only; no assignment decision.
         auto& state = peers_[peer_transport_.at(local).peerIndex].swarm_states_.at(swarmId);
         auto& connection = state.connections.at(local == sender ? receiver : sender);
         if (local == sender) connection.uploadedInWindow += bytes;
@@ -218,36 +342,24 @@ void Network::rechoke(PeerId local, SwarmId swarmId, std::uint64_t cycle, double
         : policy.nextOptimisticDeadline;
     policy.eventPending = false;
     policy.pendingWakeup.reset();
-    if (!hasUsefulExchange(local, swarmId)) {
-        updateChoking(local, swarmId);
-        return;
-    }
     if (regular) {
-        const double interval = bitTorrentSettings_.regularRechokeInterval;
-        for (auto& [id, connection] : state.connections) {
-            // Divide in two stages to avoid overflow when 2 * interval is nonfinite.
-            const double divisor = policy.previousIntervalMeasured ? 2.0 : 1.0;
-            connection.recentDownloadRate =
-                (static_cast<double>(connection.downloadedPreviousInterval) + connection.downloadedInWindow) / interval / divisor;
-            connection.recentUploadRate =
-                (static_cast<double>(connection.uploadedPreviousInterval) + connection.uploadedInWindow) / interval / divisor;
-            connection.downloadedPreviousInterval = connection.downloadedInWindow;
-            connection.uploadedPreviousInterval = connection.uploadedInWindow;
-            connection.downloadedInWindow = connection.uploadedInWindow = 0;
-        }
-        policy.previousIntervalMeasured = true;
-        policy.windowStart = deadline;
+        measureRates(state, deadline, bitTorrentSettings_.regularRechokeInterval);
         const auto interested = rankedInterested(local, swarmId);
         policy.preferred.clear();
         for (const auto remote : interested) {
-            if (policy.preferred.size() == preferredSlots) break;
+            if (policy.preferred.size() == interestedSlots - 1) break;
             policy.preferred.insert(remote);
         }
     }
     policy.nextRegularDeadline = nextRegular;
     policy.nextOptimisticDeadline = nextOptimistic;
-    fillChokingSlots(local, swarmId, optimistic);
-    applyChoking(local, swarmId);
-    scheduleRechoke(local, swarmId);
+    if (regular) {
+        fillChokingSlots(local, swarmId, optimistic);
+        applyChoking(local, swarmId);
+    } else if (optimistic) {
+        repairOptimistic(local, swarmId, true);
+    }
+    // Keep the phase/history, but omit redundant idle events so run() can drain.
+    if (hasUsefulExchange(local, swarmId)) scheduleRechoke(local, swarmId);
 }
 }
