@@ -15,6 +15,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPainterPathStroker>
 #include <QGraphicsPathItem>
 #include <utility>
 #include <cmath>
@@ -23,6 +24,18 @@
 #include <QResizeEvent>
 
 namespace {
+class RuntimeWireItem : public QGraphicsPathItem {
+public:
+    RuntimeWireItem(const QPainterPath& path, RuntimeLinkSelection link)
+        : QGraphicsPathItem(path), link(link) {}
+    QPainterPath shape() const override {
+        QPainterPathStroker stroke;
+        stroke.setWidth(10);
+        return stroke.createStroke(path());
+    }
+    QRectF boundingRect() const override { return shape().boundingRect(); }
+    RuntimeLinkSelection link;
+};
 QPointF clampedNodePosition(const QGraphicsItem& node, const QPointF& position,
                            const QGraphicsView& view)
 {
@@ -178,19 +191,20 @@ PeerNode* SimulationView::addPeerNode(const ScenarioPeer& peer)
     auto* node = new PeerNode(peer, *this);
     scene()->addItem(node);
     node->moved = [this, swarmId = swarmId_, id = peer.id](QPointF position) {
-        if (editingEnabled_ && (!pendingPeer_ || pendingPeer_->id != id) && peerMoved)
+        if (peersMovable() && (!pendingPeer_ || pendingPeer_->id != id) && peerMoved)
             peerMoved(swarmId, id, position);
         if (!runtimeWires_.empty()) drawRuntimeLinks();
     };
     node->setPos(clampedNodePosition(*node, peer.position, *this));
     node->moved(node->pos());
-    node->setFlag(QGraphicsItem::ItemIsMovable, editingEnabled_);
-    if (!editingEnabled_) node->unsetCursor();
+    node->setFlag(QGraphicsItem::ItemIsMovable, peersMovable());
+    if (!peersMovable()) node->unsetCursor();
     return node;
 }
 
 void SimulationView::showSwarm(const ScenarioSwarm* swarm)
 {
+    if (runtimeMenu_) runtimeMenu_->close();
     cancelPeerPlacement();
     selectPeer(std::nullopt);
     refreshRuntimeLinks({});
@@ -286,6 +300,15 @@ void SimulationView::mousePressEvent(QMouseEvent* event)
     if (event->button() == Qt::LeftButton) {
         auto* item = itemAt(event->position().toPoint());
         while (item && item->parentItem()) item = item->parentItem();
+        if (!editingEnabled_) {
+            if (const auto* wire = dynamic_cast<RuntimeWireItem*>(item)) {
+                selectedLink_ = wire->link;
+                drawRuntimeLinks();
+                if (selectionChanged) selectionChanged();
+                event->accept();
+                return;
+            }
+        }
         auto* peer = dynamic_cast<PeerNode*>(item);
         selectPeer(peer ? std::optional<quint64>(peer->id) : std::nullopt);
     }
@@ -304,7 +327,6 @@ void SimulationView::keyPressEvent(QKeyEvent* event)
 
 void SimulationView::contextMenuEvent(QContextMenuEvent* event)
 {
-    if (!editingEnabled_) { event->accept(); return; }
     if (suppressContextMenu_) {
         suppressContextMenu_ = false;
         event->accept();
@@ -319,6 +341,25 @@ void SimulationView::contextMenuEvent(QContextMenuEvent* event)
     while (item && item->parentItem()) item = item->parentItem();
     auto* node = dynamic_cast<PeerNode*>(item);
     if (!node) return;
+    if (!editingEnabled_) {
+        if (runtimeMenu_) runtimeMenu_->close();
+        const auto membership = runtimeMembership ? runtimeMembership(swarmId_, node->id) : std::nullopt;
+        auto* menu = new QMenu(this);
+        runtimeMenu_ = menu;
+        menu->setAttribute(Qt::WA_DeleteOnClose);
+        auto* action = menu->addAction(membership && *membership ? tr("Leave swarm") : tr("Join swarm"));
+        action->setEnabled(membership.has_value());
+        if (!membership) action->setToolTip(tr("This swarm is not part of the runtime session."));
+        connect(action, &QAction::triggered, this,
+            [this, swarm = swarmId_, peer = node->id, joined = membership && *membership] {
+                if (!editingEnabled_ && swarmId_ == swarm && runtimeMembershipChanged)
+                    runtimeMembershipChanged(swarm, peer, !joined);
+            });
+        // No nested event loop and no retained PeerNode pointer while playback runs.
+        menu->popup(event->globalPos());
+        event->accept();
+        return;
+    }
     QMenu menu(this);
     auto* membership = menu.addAction(node->initiallyJoined() ? tr("Leave Swarm") : tr("Join Swarm"));
     auto* remove = menu.addAction(tr("Remove Peer"));
@@ -348,13 +389,29 @@ bool SimulationView::viewportEvent(QEvent* event)
 void SimulationView::setEditingEnabled(bool enabled)
 {
     if (!enabled) cancelPeerPlacement();
-    if (enabled) refreshRuntimeLinks({});
+    if (enabled) { selectedLink_.reset(); refreshRuntimeLinks({}); }
+    if (runtimeMenu_) runtimeMenu_->close();
     editingEnabled_ = enabled;
-    setInteractive(enabled);
+    if (enabled) runtimePaused_ = false;
+    updateInteraction();
+}
+
+void SimulationView::setRuntimePaused(bool paused)
+{
+    if (runtimePaused_ == paused) return;
+    runtimePaused_ = paused;
+    updateInteraction();
+}
+
+void SimulationView::updateInteraction()
+{
+    setInteractive(peersMovable());
     for (auto* item : scene()->items()) {
         if (!item->parentItem()) {
-            item->setFlag(QGraphicsItem::ItemIsMovable, enabled);
-            if (enabled) item->setCursor(Qt::OpenHandCursor);
+            const bool movable = dynamic_cast<PeerNode*>(item) ? peersMovable()
+                : dynamic_cast<TrackerNode*>(item) && editingEnabled_;
+            item->setFlag(QGraphicsItem::ItemIsMovable, movable);
+            if (movable) item->setCursor(Qt::OpenHandCursor);
             else item->unsetCursor();
         }
     }
@@ -362,7 +419,8 @@ void SimulationView::setEditingEnabled(bool enabled)
 
 void SimulationView::selectPeer(std::optional<quint64> id)
 {
-    if (selectedPeer_ == id) return;
+    if (selectedPeer_ == id && !selectedLink_) return;
+    selectedLink_.reset();
     refreshRuntimeLinks({});
     selectedPeer_ = id;
     for (auto* item : scene()->items())
@@ -382,7 +440,13 @@ void SimulationView::refreshPeerColors(const std::function<PeerInspection(quint6
 
 void SimulationView::refreshRuntimeLinks(std::vector<RuntimeWire> wires)
 {
-    runtimeWires_ = editingEnabled_ ? std::vector<RuntimeWire>{} : std::move(wires);
+    if (editingEnabled_) wires.clear();
+    if (runtimeWires_ == wires) return; // Rebuild only for changed roles/active IDs; dragging redraws geometry separately.
+    runtimeWires_ = std::move(wires);
+    if (selectedLink_ && std::none_of(runtimeWires_.begin(), runtimeWires_.end(), [&](const RuntimeWire& wire) {
+        return std::min(wire.sender, wire.receiver) == selectedLink_->a
+            && std::max(wire.sender, wire.receiver) == selectedLink_->b;
+    })) selectedLink_.reset();
     drawRuntimeLinks();
 }
 
@@ -417,7 +481,21 @@ void SimulationView::drawRuntimeLinks()
         path.lineTo(end - unit * arrow - normal * (arrow / 2));
         const QColor color = wire.role == RuntimeWireRole::Choked ? QColor("#666666")
             : wire.role == RuntimeWireRole::Optimistic ? QColor("#287bff") : QColor("#299447");
-        auto* item = scene()->addPath(path, QPen(color, 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        const RuntimeLinkSelection link{std::min(wire.sender, wire.receiver), std::max(wire.sender, wire.receiver)};
+        auto* item = new RuntimeWireItem(path, link);
+        item->setPen(QPen(color, selectedLink_ == link ? 3.5 : 2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        item->setToolTip(tr("Link %1 - %2").arg(link.a).arg(link.b));
+        scene()->addItem(item);
+        if (wire.active) {
+            const auto pixmap = QPixmap(wire.activeIcon).scaled(20, 20, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            auto* packet = new QGraphicsPixmapItem(pixmap, item);
+            packet->setOffset(-pixmap.width() / 2.0, -pixmap.height() / 2.0);
+            packet->setShapeMode(QGraphicsPixmapItem::BoundingRectShape);
+            packet->setPos((from + to) / 2 + normal * 13);
+            packet->setToolTip(tr("Active transmission %1: %2 -> %3").arg(*wire.active).arg(wire.sender).arg(wire.receiver));
+            packet->setData(0, QVariant::fromValue<qulonglong>(*wire.active));
+            packet->setAcceptedMouseButtons(Qt::NoButton);
+        }
         item->setZValue(-1);
         item->setAcceptedMouseButtons(Qt::NoButton);
         wireItems_.push_back(item);

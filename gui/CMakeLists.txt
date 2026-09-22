@@ -7,6 +7,7 @@ qt_add_executable(picoTorrent_gui
     AddPeerDialog.cpp
     MessageInfoDialog.hpp
     MessageInfoDialog.cpp
+    RuntimeLogDialog.hpp RuntimeLogDialog.cpp
     AddSwarmDialog.hpp
     AddSwarmDialog.cpp
     ScenarioSwarm.hpp
@@ -31,6 +32,7 @@ set_target_properties(picoTorrent_gui PROPERTIES
 target_sources(picotorrent_runtime PRIVATE
     RuntimeSession.hpp RuntimeSession.cpp RuntimePump.hpp PlaybackClock.hpp
     RuntimeLinks.hpp RuntimeLinks.cpp
+    RuntimeEventLog.hpp RuntimeEventLog.cpp
     ScenarioPersistence.hpp ScenarioPersistence.cpp
     ScenarioPieces.hpp ScenarioPieces.cpp PeerInspection.hpp PeerInspection.cpp
     ../src/Simulation.cpp ../src/Peer.cpp ../src/Link.cpp ../src/Message.cpp
@@ -42,6 +44,24 @@ target_link_libraries(picotorrent_runtime PUBLIC Qt6::Core)
 target_link_libraries(picoTorrent_gui PRIVATE picotorrent_runtime Qt6::Widgets)
 
 if(BUILD_TESTING)
+    add_executable(runtime_event_log_tests ../tests/RuntimeEventLogTests.cpp RuntimeLogDialog.cpp resources.qrc)
+    set_target_properties(runtime_event_log_tests PROPERTIES AUTORCC ON)
+    target_link_libraries(runtime_event_log_tests PRIVATE picotorrent_runtime Qt6::Widgets)
+    add_test(NAME runtime_event_log COMMAND runtime_event_log_tests)
+    set_tests_properties(runtime_event_log PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    if(TARGET Qt6::QOffscreenIntegrationPlugin)
+        set_property(TEST runtime_event_log APPEND PROPERTY ENVIRONMENT
+            "QT_QPA_PLATFORM_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::QOffscreenIntegrationPlugin>")
+    endif()
+    add_executable(runtime_interaction_tests ../tests/RuntimeInteractionTests.cpp SimulationView.cpp resources.qrc)
+    set_target_properties(runtime_interaction_tests PROPERTIES AUTORCC ON)
+    target_link_libraries(runtime_interaction_tests PRIVATE picotorrent_runtime Qt6::Widgets)
+    add_test(NAME runtime_interaction COMMAND runtime_interaction_tests)
+    set_tests_properties(runtime_interaction PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    if(TARGET Qt6::QOffscreenIntegrationPlugin)
+        set_property(TEST runtime_interaction APPEND PROPERTY ENVIRONMENT
+            "QT_QPA_PLATFORM_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::QOffscreenIntegrationPlugin>")
+    endif()
     add_executable(runtime_links_tests ../tests/RuntimeLinksTests.cpp)
     target_link_libraries(runtime_links_tests PRIVATE picotorrent_runtime)
     add_test(NAME runtime_links COMMAND runtime_links_tests)

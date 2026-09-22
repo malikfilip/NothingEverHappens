@@ -56,7 +56,7 @@ No manual tracker registration, handshakes, or protocol logic exist in the bridg
 Never-joined red peers have no engine PeerSwarmState yet. Their inventory is kept
 in the scenario and session binding for a later first join. Creating inactive
 membership directly is not a public engine operation; this bridge deliberately
-does not fake a join/leave cycle. Future first joins must supply that inventory;
+does not fake a join/leave cycle. Manual first joins supply that inventory;
 rejoins must omit initialBitfield to preserve the engine's downloaded data.
 
 Positions are frozen at Play. For the visible canvas rectangle, the bridge uses
@@ -82,6 +82,52 @@ allows larger sizes/IDs. Oversized piece lengths/counts reject; scenario IDs are
 mapped without narrowing. Large bitfields can still exhaust memory; startup
 exceptions are reported without publishing partial scenario state. Capacities
 use double bits/s in the engine, so very large exact integers may be rounded.
+## Manual runtime membership and paused layout
+
+RuntimeSession::peerMembership maps scenario IDs to actual engine active state;
+missing bindings identify skipped swarms. The runtime peer context menu offers
+Leave swarm for active members and Join swarm for inactive members, never Remove
+Peer or configuration actions. Skipped swarms remain excluded (Join is disabled).
+The runtime menu is nonmodal: it retains IDs, not scene-item pointers, and is
+closed on swarm switches and runtime teardown.
+
+RuntimePump::executeCommand stops playback timers between Qt callbacks, and the
+bridge uses Simulation::executeNow with the existing PeerJoinEvent/PeerLeaveEvent
+at Simulation::currentTime(). It never steps unrelated queued events or uses
+interpolated display time. The display anchor is rebased to that engine time;
+previously running playback resumes, previously paused playback stays paused.
+Errors leave playback paused. The existing event observer logs the command and
+post-command refresh updates colors, inspector and wires immediately.
+
+Leave uses Network's existing tracker STOPPED removal, generation invalidation,
+connection/request cleanup on both sides, and cancellation of affected queued
+and active transfers. Old propagating messages and tracker/rechoke events become
+stale no-ops. Survivors retain the existing request recovery and optimistic-repair
+policy. No synthetic CANCEL messages or second cleanup system are introduced.
+Peer identity, capacities, complete pieces and partial downloaded block ranges
+survive within the runtime. Rejoin retains these data, resets connection/discovery
+and choking state, and schedules STARTED at current engine time. Registration,
+discovery, handshakes, availability and interest exchange proceed through the
+normal queued events when playback or Next Event executes them.
+
+Engine physical Links are retained across leave/rejoin. Runtime wire inspection
+hides any Link with an inactive endpoint. Rejoining makes retained physical Links
+visible again (gray until the sender has an unchoked connection).
+
+PAUSED enables only PeerNode movement; PLAYING disables dragging, and trackers
+remain immovable in both runtime states. Movement writes the existing scenario
+position and redraws wire geometry, without stepping or mutating the engine.
+Normalized runtime positions and the LinkConfigProvider stay frozen at Play,
+including for Links first created after a moved peer joins. Swarm switching,
+Resume and Stop retain the edited visual positions. Stop's existing snapshot
+retains completed pieces and current membership, but not partial block ranges.
+
+runtime_interaction_tests runs offscreen Qt Widgets without sleeps. It exercises
+the actual runtime context menu, colors, native dragging and wire paths, plus
+membership changes through the pump/bridge, and verifies unchanged engine time
+and frozen link latency. Core lifecycle tests cover stale messages/events,
+request recovery, partial-block preservation and departure during transport.
+
 ## Validation
 
 With PICOTORRENT_BUILD_GUI and BUILD_TESTING enabled, runtime_session_tests links

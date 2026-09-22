@@ -39,7 +39,8 @@
 #include <QScrollArea>
 #include <QSplitter>
 #include <QStackedWidget>
-#include <QStandardItemModel>
+#include "RuntimeEventLog.hpp"
+#include "RuntimeLogDialog.hpp"
 #include <QStyle>
 #include <QTableView>
 #include <QToolBar>
@@ -107,17 +108,18 @@ MainWindow::MainWindow(QWidget* parent)
     };
     pump_.stateChanged = [this] {
         updateRuntimeControls();
+        if (eventLogModel_ && pump_.state() == RuntimePump::State::Paused) eventLogModel_->flush();
         pump_.playbackChanged();
     };
     pump_.stepped = [this] {
         simulationTime_->setText(simulationTimeText(pump_.playbackTime()));
-        eventLog_->scrollToBottom();
+        eventLogModel_->finishStep(true, pump_.state() != RuntimePump::State::Running);
         refreshInspector();
         presentCompletions();
     };
     pump_.failed = [this](const char* message) {
         simulationTime_->setText(simulationTimeText(pump_.playbackTime()));
-        eventLog_->scrollToBottom();
+        eventLogModel_->finishStep(false, true);
         refreshInspector();
         QMessageBox::critical(this, tr("Simulation paused after an error"), QString::fromUtf8(message));
         resumeAfterCompletions_ = false;
@@ -130,6 +132,7 @@ MainWindow::MainWindow(QWidget* parent)
     canvasLayout->addWidget(canvas_);
     canvas_->selectionChanged = [this] { refreshInspector(); };
     canvas_->peerPlaced = [this](quint64 swarmId, const ScenarioPeer& peer) {
+        if (runtime_) return;
         if (auto* swarm = findSwarm(swarmId)) {
             swarm->peers.push_back(peer);
             ++nextPeerId_;
@@ -143,15 +146,24 @@ MainWindow::MainWindow(QWidget* parent)
         }
     };
     canvas_->peerRemoved = [this](quint64 swarmId, quint64 peerId) {
+        if (runtime_) return;
         if (auto* swarm = findSwarm(swarmId))
             std::erase_if(swarm->peers, [peerId](const ScenarioPeer& peer) { return peer.id == peerId; });
     };
     canvas_->peerInitiallyJoinedChanged = [this](quint64 swarmId, quint64 peerId, bool joined) {
+        if (runtime_) return;
         if (auto* swarm = findSwarm(swarmId)) {
             for (auto& peer : swarm->peers)
                 if (peer.id == peerId) { peer.initiallyJoined = joined; break; }
         }
         refreshInspector();
+    };
+    canvas_->runtimeMembership = [this](quint64 swarmId, quint64 peerId) {
+        return runtime_ ? runtime_->peerMembership(swarmId, peerId) : std::nullopt;
+    };
+    canvas_->runtimeMembershipChanged = [this](quint64 swarmId, quint64 peerId, bool joined) {
+        if (!runtime_ || presentingCompletions_) return;
+        pump_.executeCommand([&] { runtime_->setPeerMembership(swarmId, peerId, joined); });
     };
     canvas_->trackerMoved = [this](quint64 swarmId, QPointF position) {
         if (auto* swarm = findSwarm(swarmId)) swarm->trackerPosition = position;
@@ -159,6 +171,7 @@ MainWindow::MainWindow(QWidget* parent)
     canvas_->placementChanged = [this] {
         addPeerAction_->setEnabled(!runtime_ && swarmSelector_->currentIndex() >= 0 && !canvas_->isPlacingPeer());
         updateRuntimeControls();
+
         canvas_->setToolTip(canvas_->isPlacingPeer()
             ? tr("Click to place the peer. Escape or right-click cancels placement.") : QString{});
     };
@@ -330,7 +343,7 @@ void MainWindow::importScenario()
     }
     swarmInfo_->setEnabled(!swarms_.empty());
     if (!swarms_.empty()) swarmSelector_->setCurrentIndex(0);
-    eventLogModel_->removeRows(0, eventLogModel_->rowCount());
+    eventLogModel_->resetSession();
     pump_.stop();
     refreshInspector();
     updateRuntimeControls();
@@ -358,7 +371,19 @@ QWidget* MainWindow::createInspector()
     inspectorDetails_ = new QLabel(scroll);
     inspectorDetails_->setObjectName("peerInspectorDetails");
     inspectorDetails_->setTextFormat(Qt::PlainText);
-    inspectorDetails_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    inspectorDetails_->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::LinksAccessibleByMouse);
+    connect(inspectorDetails_, &QLabel::linkActivated, this, [this](const QString& href) {
+        bool valid = false;
+        const auto id = href.toULongLong(&valid);
+        if (valid && runtime_ && canvas_->selectedLink() && pump_.state() == RuntimePump::State::Paused
+            && runtime_->network().activeTransmissions().contains(id)) {
+            const auto& active = runtime_->network().activeTransmissions().at(id);
+            const auto check = messageChecks_.find(active.message.type());
+            if (check == messageChecks_.end() || !check->second->isChecked()) return;
+            auto dialog = createActiveTransmissionDialog(active, runtime_->simulation().currentTime(), true, this);
+            if (dialog) dialog->exec();
+        }
+    });
     inspectorDetails_->setWordWrap(true);
     inspectorDetails_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
     scroll->setWidget(inspectorDetails_);
@@ -386,9 +411,18 @@ QWidget* MainWindow::createEventLog()
     table->setObjectName("eventLog");
     table->setMinimumHeight(100);
     eventLog_ = table;
-    auto* model = new QStandardItemModel(0, 2, table);
+    auto* model = new RuntimeEventLog(table);
     eventLogModel_ = model;
-    model->setHorizontalHeaderLabels({tr("Time (s)"), tr("Event")});
+    model->visible = [this](simulator::MessageType type) {
+        const auto check = messageChecks_.find(type);
+        return check != messageChecks_.end() && check->second->isChecked();
+    };
+    connect(model, &QAbstractItemModel::rowsInserted, table, [table] { table->scrollToBottom(); });
+    connect(table, &QTableView::clicked, this, [this](const QModelIndex& index) {
+        if (!runtime_ || pump_.state() != RuntimePump::State::Paused) return;
+        auto dialog = createRuntimeLogDialog(*eventLogModel_, index.row(), true, this);
+        if (dialog) dialog->exec();
+    });
     table->setModel(model);
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -439,6 +473,9 @@ QWidget* MainWindow::createMessageFilter()
         const int row = static_cast<int>(i);
         checksLayout->addWidget(checks[i], row, 0);
         const auto type = types[i];
+        messageChecks_.emplace(type, checks[i]);
+        checks[i]->setObjectName(QStringLiteral("messageFilter_%1").arg(MessageInfoDialog::messageName(type)));
+        connect(checks[i], &QCheckBox::toggled, this, [this] { refreshInspector(); });
         auto* icon = new QToolButton(contents);
         icon->setAutoRaise(true);
         icon->setToolButtonStyle(Qt::ToolButtonIconOnly);
@@ -602,19 +639,31 @@ void MainWindow::play()
     canvas_->setEditingEnabled(false);
     addSwarmAction_->setEnabled(false);
     addPeerAction_->setEnabled(false);
-    eventLogModel_->removeRows(0, eventLogModel_->rowCount());
+    eventLogModel_->resetSession();
+    std::map<simulator::PeerId, QString> peerNames;
+    std::map<simulator::SwarmId, QString> swarmNames;
+    for (const auto& swarm : swarms_) {
+        const auto id = runtime_->swarmIds().find(swarm.id);
+        if (id == runtime_->swarmIds().end()) continue;
+        swarmNames.emplace(id->second, swarm.name);
+        for (const auto& peer : swarm.peers) {
+            const auto binding = runtime_->peerBindings().find(peer.id);
+            if (binding != runtime_->peerBindings().end()) peerNames.emplace(binding->second.peerId, peer.name);
+        }
+    }
+    eventLogModel_->peerName = [names = std::move(peerNames)](simulator::PeerId id) {
+        const auto found = names.find(id); return found == names.end() ? QString::number(id) : found->second;
+    };
+    eventLogModel_->swarmName = [names = std::move(swarmNames)](simulator::SwarmId id) {
+        const auto found = names.find(id); return found == names.end() ? QString::number(id) : found->second;
+    };
     runtime_->simulation().setEventObserver([this](const simulator::Event& event) {
         if (const auto* completed = dynamic_cast<const simulator::PeerCompletedEvent*>(&event))
             queueCompletion(completed->peerId(), completed->swarmId());
-        // Pre-execution notification, including synchronous executeNow dispatches.
-        // Copy descriptions only; never infer post-event state or retain references.
-        constexpr int maximumLogRows = 2000;
-        if (eventLogModel_->rowCount() >= maximumLogRows)
-            eventLogModel_->removeRow(0);
-        eventLogModel_->appendRow({new QStandardItem(QString::number(event.time(), 'f', 6)),
-            new QStandardItem(QString::fromStdString(event.traceDescription()))});
+        eventLogModel_->observe(event, runtime_->network());
     });
     refreshInspector();
+    eventLogModel_->sessionStarted(runtime_->network(), runtime_->simulation().currentTime());
     pump_.start(runtime_->simulation());
 }
 
@@ -631,6 +680,7 @@ void MainWindow::stopSimulation()
         resumeAfterCompletions_ = false;
         completionTimer_.stop();
         updateRuntimeControls();
+
         QMessageBox::critical(this, tr("Stop Simulation"),
             tr("Could not save peer state. The session remains paused:\n%1")
                 .arg(QString::fromUtf8(error.what())));
@@ -648,7 +698,7 @@ void MainWindow::stopSimulation()
         completionPopup_->close();
         completionPopup_ = nullptr;
     }
-    eventLogModel_->removeRows(0, eventLogModel_->rowCount());
+    eventLogModel_->resetSession();
     canvas_->setEditingEnabled(true);
     simulationTime_->setText(simulationTimeText(0));
     refreshInspector();
@@ -718,6 +768,7 @@ void MainWindow::showNextCompletion()
 void MainWindow::updateRuntimeControls()
 {
     const auto state = pump_.state();
+    canvas_->setRuntimePaused(runtime_ && state == RuntimePump::State::Paused && !presentingCompletions_);
     stopAction_->setEnabled(runtime_ != nullptr);
     const bool editing = !runtime_ && state == RuntimePump::State::Edit;
     importAction_->setEnabled(editing);
@@ -752,8 +803,19 @@ void MainWindow::editSwarm(quint64 id)
 void MainWindow::refreshInspector()
 {
     if (!inspectorContents_) return;
+    std::optional<RuntimeEventLog::Selection> logPeer;
+    if (runtime_ && canvas_->selectedPeer()) {
+        const auto binding = runtime_->peerBindings().find(*canvas_->selectedPeer());
+        if (binding != runtime_->peerBindings().end() && binding->second.scenarioSwarmId == canvas_->shownSwarm())
+            logPeer = std::pair{binding->second.peerId, binding->second.swarmId};
+    }
+    eventLogModel_->select(logPeer);
+    const MessageVisibility visible = [this](simulator::MessageType type) {
+        const auto check = messageChecks_.find(type);
+        return check != messageChecks_.end() && check->second->isChecked();
+    };
     canvas_->refreshRuntimeLinks(inspectRuntimeLinks(runtime_.get(),
-        canvas_->shownSwarm(), canvas_->selectedPeer()));
+        canvas_->shownSwarm(), canvas_->selectedPeer(), visible));
     // This shared path runs after each atomic step and when a swarm is shown.
     // Refresh all visible nodes even when no peer is selected in the Inspector.
     if (const auto* shown = findSwarm(canvas_->shownSwarm())) {
@@ -763,6 +825,17 @@ void MainWindow::refreshInspector()
             return peer == shown->peers.end() ? PeerInspection{} : inspectPeer(*shown, *peer, runtime_.get());
         });
     }
+    if (runtime_ && canvas_->selectedLink()) {
+        inspectorDetails_->setTextFormat(Qt::RichText);
+        inspectorDetails_->setText(inspectRuntimeLinkHtml(*runtime_, *canvas_->selectedLink(), std::nullopt, visible, findSwarm(canvas_->shownSwarm())));
+        inspectorContents_->setCurrentIndex(1);
+        viewPieces_->hide();
+        piecesDialog_->hide();
+        return;
+    }
+
+    inspectorDetails_->setTextFormat(Qt::PlainText);
+    viewPieces_->show();
     const auto selected = canvas_->selectedPeer();
     const auto* swarm = selected ? findSwarm(canvas_->shownSwarm()) : nullptr;
     const ScenarioPeer* peer = nullptr;

@@ -42,6 +42,27 @@ public:
         if (playbackChanged) playbackChanged();
         if (stateChanged) stateChanged();
     }
+    // Called between Qt callbacks, never from inside an engine event.
+    // Commands run at engine time, not at the interpolated display position.
+    void executeCommand(const std::function<void()>& command) {
+        if (!simulation_ || state_ == State::Edit) return;
+        const bool wasRunning = state_ == State::Running;
+        pause();
+        try {
+            command();
+            pacing_.reset(simulation_->currentTime(), now());
+            if (stepped) stepped();
+        } catch (const std::exception& error) {
+            pacing_.reset(simulation_->currentTime(), now());
+            if (failed) failed(error.what());
+            if (playbackChanged) playbackChanged();
+            if (stateChanged) stateChanged();
+            return; // A failed command leaves playback paused.
+        }
+        if (playbackChanged) playbackChanged();
+        if (stateChanged) stateChanged();
+        if (wasRunning) resume();
+    }
     double playbackSpeed() const { return pacing_.speed(); }
     void setPlaybackSpeed(double speed) {
         pacing_.setSpeed(speed, simulation_ ? simulation_->currentTime() : 0, now());

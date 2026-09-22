@@ -330,6 +330,85 @@ void completedSnapshot()
         "Completed inventory did not survive fresh Play");
 }
 
+void manualMembership()
+{
+    auto input = scenario();
+    auto runtime = RuntimeSession::create(input, {0,0,100,100});
+    const auto swarmId = input[0].id, scenarioPeer = input[0].peers[1].id;
+    const auto binding = runtime->peerBindings().at(scenarioPeer);
+    const auto seed = runtime->peerBindings().at(input[0].peers[0].id);
+    const auto& net = runtime->network();
+    auto& sim = runtime->simulation();
+    bool connected = false;
+    for (unsigned i = 0; i < 10000 && sim.step(); ++i) {
+        const auto& connections = net.peer(binding.peerId).swarmState(binding.swarmId).connections;
+        if (connections.contains(seed.peerId) && connections.at(seed.peerId).handshakeComplete()
+            && net.peer(seed.peerId).swarmState(seed.swarmId).connections.at(binding.peerId).handshakeComplete()) {
+            connected = true; break;
+        }
+    }
+    check(connected && sim.currentTime() > 0, "Manual lifecycle setup did not establish a session");
+    const auto time = sim.currentTime();
+    const auto old = net.peer(binding.peerId).swarmState(binding.swarmId);
+    const auto identity = net.peer(binding.peerId).protocolId();
+    unsigned commands = 0;
+    sim.setEventObserver([&](const simulator::Event& event) {
+        ++commands;
+        check(event.time() == time, "Manual membership used display/future time");
+    });
+    runtime->setPeerMembership(swarmId, scenarioPeer, false);
+    const auto& left = net.peer(binding.peerId).swarmState(binding.swarmId);
+    check(commands == 1 && sim.currentTime() == time && !left.active && left.connections.empty()
+        && left.choking.preferred.empty() && !left.choking.optimistic && !left.choking.eventPending,
+        "Leave did not clear current membership/policy atomically");
+    check(left.localBitfield == old.localBitfield && left.receivedBlocks == old.receivedBlocks,
+        "Leave lost downloaded state");
+    check(!net.peer(seed.peerId).swarmState(seed.swarmId).connections.contains(binding.peerId)
+        && !net.tracker().registeredPeers(net.swarm(binding.swarmId).infoHash()).contains(binding.peerId),
+        "Leave retained tracker/session state");
+    for (const auto& [id, transmission] : net.activeTransmissions())
+        check(transmission.sender != binding.peerId && transmission.receiver != binding.peerId,
+            "Departed peer retained an active transmission");
+    check(input[0].peers.size() == 3 && input[0].peers[1].id == scenarioPeer
+        && input[0].peers[1].initiallyJoined, "Runtime leave changed scenario definition");
+    check(!inspectPeer(input[0], input[0].peers[1], runtime.get()).joined,
+        "Runtime inspection retained active state");
+    runtime->setPeerMembership(swarmId, scenarioPeer, false);
+    check(commands == 1, "Duplicate leave emitted an event");
+    runtime->setPeerMembership(swarmId, scenarioPeer, true);
+    const auto& rejoined = net.peer(binding.peerId).swarmState(binding.swarmId);
+    check(commands == 2 && sim.currentTime() == time && sim.nextEventTime() == time
+        && rejoined.active && rejoined.connections.empty() && !rejoined.choking.managed
+        && rejoined.lifecycleGeneration == old.lifecycleGeneration + 2,
+        "Rejoin reused stale session or advanced time");
+    check(net.peer(binding.peerId).protocolId() == identity
+        && rejoined.localBitfield == old.localBitfield && rejoined.receivedBlocks == old.receivedBlocks,
+        "Rejoin changed identity or inventory");
+    const auto inactive = input[0].peers[2].id;
+    runtime->setPeerMembership(swarmId, inactive, true);
+    const auto newcomer = runtime->peerBindings().at(inactive);
+    check(net.peer(newcomer.peerId).swarmState(newcomer.swarmId).localBitfield == newcomer.initialBitfield,
+        "First manual join lost prepared initial inventory");
+    check(!runtime->peerMembership(input[2].id, input[2].peers[0].id)
+        && !runtime->peerMembership(swarmId + 100, scenarioPeer), "Excluded swarm acquired membership");
+    bool rejected = false;
+    try { runtime->setPeerMembership(input[2].id, input[2].peers[0].id, true); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    check(rejected, "Skipped swarm manually created");
+    sim.setEventObserver({});
+    bool rebuilt = false;
+    for (unsigned i = 0; i < 10000 && sim.step(); ++i) {
+        const auto& connections = net.peer(binding.peerId).swarmState(binding.swarmId).connections;
+        if (connections.contains(seed.peerId) && connections.at(seed.peerId).handshakeComplete()) {
+            rebuilt = true; break;
+        }
+    }
+    check(rebuilt, "Manual rejoin did not rebuild a handshake");
+    runtime->setPeerMembership(swarmId, scenarioPeer, false);
+    runtime->snapshotToScenario(input);
+    check(!input[0].peers[1].initiallyJoined && input[0].peers[2].initiallyJoined,
+        "Stop snapshot lost manual membership changes");
+}
 void settingsSnapshot()
 {
     ScenarioSettings settings;
@@ -440,6 +519,7 @@ void deterministicOwnershipAndGeometry()
 int main()
 {
     try {
+        manualMembership();
         snapshotAndFreshRestart();
         completedSnapshot();
         settingsSnapshot();

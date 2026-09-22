@@ -8,6 +8,7 @@
 #include <QStringList>
 #include <map>
 #include <memory>
+#include <optional>
 
 struct PlayPreflight {
     QStringList errors;
@@ -39,6 +40,11 @@ public:
     // Strong transaction: scenario ownership is published only after complete startup.
     static std::unique_ptr<RuntimeSession> create(std::vector<ScenarioSwarm>& scenario,
         const QRectF& visibleCanvas, std::uint64_t seed = 0, ScenarioSettings settings = {});
+
+    // nullopt identifies a peer/swarm excluded from this runtime.
+    std::optional<bool> peerMembership(quint64 scenarioSwarm, quint64 scenarioPeer) const;
+    // One existing lifecycle event at engine currentTime(); never drains the queue.
+    void setPeerMembership(quint64 scenarioSwarm, quint64 scenarioPeer, bool joined);
 
     // Publish only completed ownership and membership; strong transaction.
     void snapshotToScenario(std::vector<ScenarioSwarm>& scenario) const;

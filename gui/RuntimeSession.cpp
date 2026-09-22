@@ -1,5 +1,7 @@
 #include "RuntimeSession.hpp"
 #include "ScenarioPieces.hpp"
+#include "simulator/PeerJoinEvent.hpp"
+#include "simulator/PeerLeaveEvent.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -158,6 +160,34 @@ RuntimeSession::RuntimeSession(std::vector<ScenarioSwarm>& scenario, const QRect
         network_->joinSwarm(binding.swarmId, binding.peerId, std::move(options));
     }
     // No step()/run(): STARTED events intentionally remain queued at t=0.
+}
+
+std::optional<bool> RuntimeSession::peerMembership(quint64 scenarioSwarm, quint64 scenarioPeer) const
+{
+    const auto found = peerBindings_.find(scenarioPeer);
+    if (found == peerBindings_.end() || found->second.scenarioSwarmId != scenarioSwarm)
+        return std::nullopt;
+    const auto& binding = found->second;
+    return network_->peer(binding.peerId).isActiveInSwarm(binding.swarmId);
+}
+
+void RuntimeSession::setPeerMembership(quint64 scenarioSwarm, quint64 scenarioPeer, bool joined)
+{
+    const auto current = peerMembership(scenarioSwarm, scenarioPeer);
+    if (!current) throw std::invalid_argument("Peer does not belong to this runtime swarm.");
+    if (*current == joined) return;
+    const auto& binding = peerBindings_.at(scenarioPeer);
+    if (joined) {
+        simulator::JoinOptions options;
+        if (!network_->peer(binding.peerId).hasSwarm(binding.swarmId))
+            options.initialBitfield = binding.initialBitfield;
+        simulator::PeerJoinEvent event(simulation_.currentTime(), *network_,
+            binding.swarmId, binding.peerId, std::move(options));
+        simulation_.executeNow(event);
+    } else {
+        simulator::PeerLeaveEvent event(simulation_.currentTime(), *network_, binding.swarmId, binding.peerId);
+        simulation_.executeNow(event);
+    }
 }
 
 void RuntimeSession::snapshotToScenario(std::vector<ScenarioSwarm>& scenario) const

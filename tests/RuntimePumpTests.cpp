@@ -295,6 +295,40 @@ void recurringPauseResume() {
     check(callbacks == 71 && observations == 71 && simulation.currentTime() > pausedTime);
     check(times.front() == 0 && times.back() == simulation.currentTime());
 }
+void immediateCommands()
+{
+    simulator::Simulation simulation;
+    RuntimePump pump;
+    unsigned executed = 0, commands = 0;
+    simulation.schedule(std::make_unique<Action>(10, [&] { ++executed; }));
+    pump.executeCommand([&] { ++commands; });
+    check(commands == 0); // No session.
+    pump.start(simulation);
+    pump.executeCommand([&] {
+        check(pump.state() == RuntimePump::State::Paused && executed == 0);
+        Action command(simulation.currentTime(), [&] { ++commands; });
+        simulation.executeNow(command);
+    });
+    check(pump.state() == RuntimePump::State::Running && commands == 1
+        && executed == 0 && simulation.currentTime() == 0 && simulation.nextEventTime() == 10);
+    pump.pause();
+    pump.executeCommand([&] { ++commands; });
+    check(pump.state() == RuntimePump::State::Paused && commands == 2 && executed == 0);
+    pump.nextEvent();
+    check(executed == 1 && simulation.currentTime() == 10);
+    pump.executeCommand([&] {
+        simulation.schedule(std::make_unique<Action>(10, [&] { ++executed; }));
+    });
+    check(executed == 1 && pump.playbackTime() == 10);
+    pump.nextEvent();
+    check(executed == 2 && simulation.currentTime() == 10);
+    bool failed = false;
+    pump.failed = [&](const char*) { failed = true; };
+    pump.resume();
+    pump.executeCommand([] { throw std::runtime_error("command failed"); });
+    check(failed && pump.state() == RuntimePump::State::Paused && simulation.currentTime() == 10);
+    pump.stop();
+}
 void atomicOrderingEmptyAndFailure() {
     simulator::Simulation simulation;
     RuntimePump pump;
@@ -328,6 +362,7 @@ void atomicOrderingEmptyAndFailure() {
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     try {
+        immediateCommands();
         pacingCalculations();
         continuousPlaybackAndSingleStep();
         stopAndRestart();

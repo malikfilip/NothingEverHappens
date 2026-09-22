@@ -5,17 +5,19 @@
 #include "ScenarioSwarm.hpp"
 #include "ScenarioSettings.hpp"
 #include "RuntimePump.hpp"
+#include "simulator/Network.hpp"
 #include "simulator/PeerCompletedEvent.hpp"
 #include <vector>
 #include <memory>
 #include <deque>
 
+class QCheckBox;
 class QStackedWidget;
 class QComboBox;
 class QAction;
 class QLabel;
 class QTableView;
-class QStandardItemModel;
+class RuntimeEventLog;
 class SimulationView;
 class RuntimeSession;
 class QPushButton;
@@ -47,6 +49,7 @@ private:
     QWidget* createInspector();
     QWidget* createEventLog();
     QWidget* createMessageFilter();
+    std::map<simulator::MessageType, QCheckBox*> messageChecks_;
 
     std::vector<ScenarioSwarm> swarms_;
     ScenarioSettings settings_;
@@ -65,7 +68,7 @@ private:
     QAction* nextEventAction_ = nullptr;
     QLabel* simulationTime_ = nullptr;
     QTableView* eventLog_ = nullptr;
-    QStandardItemModel* eventLogModel_ = nullptr;
+    RuntimeEventLog* eventLogModel_ = nullptr;
     quint64 scenarioSeed_ = 0;
     QComboBox* swarmSelector_ = nullptr;
     QAction* swarmInfo_ = nullptr;
@@ -76,6 +79,7 @@ private:
     SimulationView* canvas_ = nullptr;
     QStackedWidget* inspectorContents_ = nullptr;
     QLabel* inspectorDetails_ = nullptr;
+
     QPushButton* viewPieces_ = nullptr;
     PieceBitmapDialog* piecesDialog_ = nullptr;
 };

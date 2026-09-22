@@ -1,4 +1,5 @@
 #include "MessageInfoDialog.hpp"
+#include "MessagePresentation.hpp"
 
 #include <QDialogButtonBox>
 #include <QLabel>
@@ -24,7 +25,7 @@ QString MessageInfoDialog::messageName(Type type)
 
 QString MessageInfoDialog::iconPath(Type type)
 {
-    return QStringLiteral(":/resources/messages/%1.png").arg(messageName(type).toLower());
+    return messageIconPath(type);
 }
 
 MessageInfoDialog::MessageInfoDialog(Type type, QWidget* parent)
